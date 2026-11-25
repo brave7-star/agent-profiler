@@ -1,0 +1,19 @@
+{
+  "_comment": [
+    "Real preference weights for `agent-profiler score --preferences`.",
+    "Copy to agent-profiler-preferences.json at a project root to have it picked up",
+    "automatically. Without this file the tool scores with its own invented weights and",
+    "labels the output preference_source=assumed_by_tool_not_elicited.",
+    "Weights are relative: 3/2/1 and 0.5/0.33/0.17 mean the same thing."
+  ],
+  "profiles": {
+    "mine": {
+      "description": "what I actually care about",
+      "weights": {
+        "cost": 3,
+        "used": 2,
+        "useful": 1
+      }
+    }
+  }
+}

@@ -1,0 +1,3 @@
+interface:
+  display_name: "Agent Profiler"
+  short_description: "Read-only diagnosis for personal agent stacks"

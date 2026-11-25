@@ -1,0 +1,10 @@
+agent-profiler-exclude.json
+
+# Live artifacts and reports carry real paths and real component names. They are
+# personal data about the environment under measurement, not evidence the repo
+# needs — the findings they produced are written up in docs/ instead. Anything
+# a run outputs belongs here.
+local/
+*.pyc
+__pycache__/
+.probe-feasibility/

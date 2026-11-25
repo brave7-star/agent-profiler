@@ -1,0 +1,4 @@
+{
+  "mcp": ["some-internal-server"],
+  "reason": "internal system: private, and this tool must not contact it"
+}
