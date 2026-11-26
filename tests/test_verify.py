@@ -163,7 +163,7 @@ def test_a_response_written_as_it_streams_is_not_called_a_contradiction():
         records.append({"type": "api-request", "id": f"stream{i}"})
         records.append(_assistant(f"ms{i}", f"stream{i}", {"input_tokens": 10, "output_tokens": 1}))
         records.append(_assistant(f"ms{i}", f"stream{i}", {"input_tokens": 10, "output_tokens": 3}))
-        records.append(_assistant(f"ms{i}", f"stream{i}", _settled_usage(325, output=315)))
+        records.append(_assistant(f"ms{i}", f"stream{i}", _settled_usage(310, output=300)))
     with _home(records):
         out = vf.verify()
     checks = _by_key(out["checks"])

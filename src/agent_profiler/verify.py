@@ -323,10 +323,11 @@ def _claude_checks(home: Path, limit: int | None) -> list[dict]:
               "fields (`iterations`, `output_tokens_details`)",
            zh="当这些副本是递增的，最后那条能靠完成字段认出来"
               "（`iterations`、`output_tokens_details`）"),
-        tr(en="the collector takes the settled copy, not the first. Counting the first "
-              "reported 1 output token for a response that produced 315",
-           zh="采集器取的是「已定稿」那条，而不是第一条。按第一条算，一次产出 315 个 token 的"
-              "回复会被记成 1 个"),
+        tr(en="the collector takes the settled copy, not the first. The first copy of a "
+              "streamed response carries a figure two orders of magnitude under the real "
+              "one; with nothing marking the last copy, there is no way to tell which to use",
+           zh="采集器取的是「已定稿」那条，而不是第一条。流式回复的第一条副本，数值能比真实值小"
+              "两个数量级；如果没有任何东西标出最后那条，就无从判断该用哪条"),
     )
     replay = Check(
         "replay_records_carry_tool_use",

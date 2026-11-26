@@ -215,16 +215,16 @@ def test_a_response_recorded_while_it_streams_reports_the_settled_total():
     """Counting once per message id used to mean counting the *first* copy.
 
     A real transcript wrote one response three times as it streamed, each copy carrying a
-    larger `output_tokens` than the last. The first copy said 1 where the response was 315,
-    so counting-once reported a figure two orders of magnitude under the truth.
+    larger `output_tokens` than the last, so counting-once reported a figure two orders of
+    magnitude under the truth. The values below are constructed to that shape.
     """
     with _env(codex=False, claude_records=_streamed_records(
-            _partial(1), _partial(3), _settled(315))) as (_root, paths):
+            _partial(1), _partial(3), _settled(300))) as (_root, paths):
         r = normalize_session(str(paths["claude"]))
         responses = _by_type(r, "model_response")
         assert len(responses) == 1
-        assert responses[0]["tokens"]["output"] == 315
-        assert r["observed"]["tokens"]["output"] == 315
+        assert responses[0]["tokens"]["output"] == 300
+        assert r["observed"]["tokens"]["output"] == 300
 
 
 def test_a_response_whose_copies_never_settle_is_still_counted():
