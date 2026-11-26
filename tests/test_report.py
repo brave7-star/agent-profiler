@@ -504,7 +504,7 @@ def _installed(tmp: Path, copies: list[dict]):
 def test_two_copies_with_different_content_are_reported_with_their_age_gap():
     """The only actionable finding in this report that needs no `useful` link, because it is
     not about value: the harness lists the name once, the files differ, and which one loaded
-    is unrecoverable — so the the owner cannot know which version is in effect."""
+    is unrecoverable — so the owner cannot know which version is in effect."""
     day = 86_400
     with tempfile.TemporaryDirectory() as raw:
         tmp = Path(raw)
@@ -522,8 +522,75 @@ def test_two_copies_with_different_content_are_reported_with_their_age_gap():
     assert ".agents" in out[0]["stale"]
     text = "\n".join(rp._duplicate_lines(out))
     assert "77 天" in text and "较旧" in text
-    # The fix is the the owner's: real configuration is the object under measurement.
+    # The fix is the owner's: real configuration is the object under measurement.
     assert "由你定" in text and "不改你的真实配置" in text
+
+
+def _rule_dup(name, harness, relative, body, mtime):
+    """A duplicate whose body is real prose, so the rule classifier has something to read."""
+    return _dup(name, harness, relative, body, mtime)
+
+
+def test_copies_that_instruct_differently_say_so_not_just_that_they_differ():
+    """A date and a byte count establish only that the files are not the same. Whether the
+    difference *matters* then needs the reader to open every copy.
+
+    Found on a real environment: of three copies of one name, two stated machine-checkable
+    rules and the third stated none. So which file the harness happened to load decided
+    whether the agent was given the rule at all — a much sharper statement than "79 days
+    apart", and free, from the same classification the `useful` link already uses.
+    """
+    day = 86_400
+    stating = ("Commit convention: the subject must end with the issue reference, "
+               "and stay within 50 characters.\n")
+    silent = "Background on how this project came about, with no rule about output.\n"
+    with tempfile.TemporaryDirectory() as raw:
+        tmp = Path(raw)
+        with _installed(tmp, [
+            _rule_dup("third-skill", "claude_code", ".claude/skills/third-skill/SKILL.md",
+                      stating, 1_760_000_000),
+            _rule_dup("third-skill", "shared", ".agents/skills/third-skill/SKILL.md",
+                      silent, 1_760_000_000 - 40 * day),
+        ]) as copies:
+            out = rp._diverged_duplicates(copies)
+
+    assert len(out) == 1
+    assert out[0]["rules_differ"] is True
+    assert out[0]["some_copy_states_no_rule"] is True
+    by_path = {c["path"]: c for c in out[0]["copies"]}
+    stated = next(c for p, c in by_path.items() if ".claude" in p)
+    assert stated["rules"], "a copy stating a rule must carry its name"
+    assert not next(c for p, c in by_path.items() if ".agents" in p)["rules"]
+
+    text = "\n".join(rp._duplicate_lines(out))
+    assert "没有声明可判定的规则" in text
+    assert "决定了这条规则到底有没有被下达" in text
+    # Still no instruction about what to do: the configuration stays the owner's.
+    assert "由你定" in text
+
+
+def test_copies_that_agree_on_their_rules_do_not_claim_they_disagree():
+    """The guard against the enrichment inventing a second problem: files can differ in
+    wording while instructing the same thing, and saying otherwise would be a false alarm
+    on top of a real one."""
+    day = 86_400
+    first = "The subject must end with the issue reference.\n"
+    second = "Always end the subject line with the issue reference, please.\n"
+    with tempfile.TemporaryDirectory() as raw:
+        tmp = Path(raw)
+        with _installed(tmp, [
+            _rule_dup("fourth-skill", "claude_code", ".claude/skills/fourth-skill/SKILL.md",
+                      first, 1_760_000_000),
+            _rule_dup("fourth-skill", "shared", ".agents/skills/fourth-skill/SKILL.md",
+                      second, 1_760_000_000 - 5 * day),
+        ]) as copies:
+            out = rp._diverged_duplicates(copies)
+
+    assert len(out) == 1, "differing bytes are still reported"
+    assert out[0]["rules_differ"] is False
+    assert out[0]["some_copy_states_no_rule"] is False
+    text = "\n".join(rp._duplicate_lines(out))
+    assert "规则不同" not in text and "没有声明可判定的规则" not in text
 
 
 def test_identical_copies_are_not_reported_as_ambiguous():

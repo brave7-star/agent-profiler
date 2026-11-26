@@ -81,8 +81,41 @@ def _reproducible(diffs: list[int], spread: int) -> bool | None:
     return spread <= MIN_DETECTABLE_TOKENS
 
 
-def _rollout_input_tokens(home: Path, since: float) -> int | None:
-    """Read the input-token total from the rollout this run just wrote."""
+def _measured_under(arms: list[dict]) -> dict:
+    """The builds and models the arms of one measurement actually ran under.
+
+    A list rather than a single value, because a build that changed mid-measurement would
+    make the two arms incomparable — which is exactly the defect this field exists to catch,
+    so it must be able to report it rather than silently keep the first value it saw.
+    """
+    def distinct(key):
+        return sorted({a[key] for a in arms if a.get(key)})
+
+    versions, models = distinct("cli_version"), distinct("model")
+    out = {"cli_version": versions[0] if len(versions) == 1 else None,
+           "model": models[0] if len(models) == 1 else None}
+    if len(versions) > 1 or len(models) > 1:
+        out["mixed"] = {"cli_versions": versions, "models": models}
+        out["warning"] = ("the arms did not all run under one build or model, so their "
+                          "difference is not a clean measurement of the file")
+    return out
+
+
+def _rollout_run(home: Path, since: float) -> dict:
+    """The input-token total from the rollout this run just wrote, and what wrote it.
+
+    The build and model are read here because a token count is only comparable to another
+    one taken under the same tokenizer. Two runs of this probe over the *same* file, two
+    weeks apart, returned different figures while each reported a pair spread of zero —
+    reproducible within its own window and not across them. Neither artifact recorded a
+    build or a model, so the two could not be reconciled at all, and the earlier figure had
+    meanwhile been quoted elsewhere as settled.
+
+    This does not explain that gap; it makes the next one answerable, which is the honest
+    thing available. A missing value stays `None` rather than being guessed at: the rollout
+    is the harness's own record, and inventing a build number would be worse than admitting
+    the run did not say.
+    """
     newest, newest_mtime = None, since
     for path in home.rglob("rollout-*.jsonl"):
         try:
@@ -92,20 +125,27 @@ def _rollout_input_tokens(home: Path, since: float) -> int | None:
         if mtime >= newest_mtime:
             newest, newest_mtime = path, mtime
     if newest is None:
-        return None
-    total = None
+        return {"input_tokens": None, "cli_version": None, "model": None}
+    total, version, model = None, None, None
     for line in newest.read_text(errors="replace").splitlines():
         try:
             record = json.loads(line)
         except json.JSONDecodeError:
             continue
-        info = (record.get("payload") or {}).get("info") or {}
+        payload = record.get("payload") or {}
+        if not isinstance(payload, dict):
+            continue
+        # `session_meta` opens the file; `turn_context` carries the model per turn, which is
+        # the one that actually priced the request.
+        version = version or payload.get("cli_version")
+        model = payload.get("model") or model
+        info = payload.get("info") or {}
         if not isinstance(info, dict):
             continue
         usage = info.get("total_token_usage") or {}
         if isinstance(usage, dict) and usage.get("input_tokens"):
             total = int(usage["input_tokens"])
-    return total
+    return {"input_tokens": total, "cli_version": version, "model": model}
 
 
 def _codex_probe(home: Path, workdir: Path, timeout: int) -> dict:
@@ -125,14 +165,16 @@ def _codex_probe(home: Path, workdir: Path, timeout: int) -> dict:
         return {"ok": False, "error": "timeout"}
     if done.returncode != 0:
         return {"ok": False, "error": f"exit {done.returncode}: {done.stderr.strip()[:160]}"}
-    total = _rollout_input_tokens(home, started - 1)
+    run = _rollout_run(home, started - 1)
+    total = run["input_tokens"]
     if total is None:
         return {"ok": False, "error": "no rollout carrying token usage was written"}
     if total > CONTEXT_CEILING:
         return {"ok": False,
                 "error": f"input tokens ({total}) exceed the {CONTEXT_CEILING} ceiling; "
                          "this probe did work instead of measuring a prefix"}
-    return {"ok": True, "input_tokens": total}
+    return {"ok": True, "input_tokens": total,
+            "cli_version": run["cli_version"], "model": run["model"]}
 
 
 def _controlled_home(tmp: Path) -> Path:
@@ -175,6 +217,7 @@ def measure_instruction_cost(instruction_file: Path, *, pairs: int = PROBE_PAIRS
                 "bytes": size_bytes, "characters": len(content)}
 
     measured_pairs: list[dict] = []
+    measured_arms: list[dict] = []
     with tempfile.TemporaryDirectory() as raw:
         tmp = Path(raw)
         home = _controlled_home(tmp)
@@ -195,6 +238,7 @@ def measure_instruction_cost(instruction_file: Path, *, pairs: int = PROBE_PAIRS
                 arms[label] = self_probe = _codex_probe(home, directory, timeout)
                 if not self_probe["ok"]:
                     break
+            measured_arms.extend(a for a in arms.values() if a.get("ok"))
             if all(arm["ok"] for arm in arms.values()) and len(arms) == 2:
                 measured_pairs.append({
                     "pair": index + 1,
@@ -226,9 +270,17 @@ def measure_instruction_cost(instruction_file: Path, *, pairs: int = PROBE_PAIRS
         "differences": diffs,
         "mean_tokens": round(mean),
         "pair_spread_tokens": spread,
+        # What produced the figure, so two runs can be compared instead of merely differing.
+        # A token count belongs to a tokenizer, and the build chooses the model.
+        "measured_under": _measured_under(measured_arms),
         "method": "a copy of the file is injected as a project AGENTS.md in a controlled "
                   "CODEX_HOME; arms alternate within one window so drift cannot read as "
                   "an effect. The real file is read, never modified.",
+        "comparability": "A token figure holds for the build and model named in "
+                         "`measured_under`. `pair_spread_tokens` is agreement between arms "
+                         "inside one window, which is not stability across runs: the same "
+                         "file measured under a different build can differ while each run "
+                         "still reports a spread of 0.",
     }
     if mean <= MIN_DETECTABLE_TOKENS:
         return {
@@ -719,7 +771,17 @@ def measure_instructions(root: str, *, pairs: int = PROBE_PAIRS, timeout: int = 
         if result.get("ok") or result.get("inconclusive"):
             measurements.append(result)
         else:
-            skipped.append({"file": str(path), "reason": result.get("reason")})
+            # `pairs` carries each attempt's own error, which is the difference between
+            # "the harness never answered" and "a pair ran and was rejected as unsound".
+            # Dropping it left `no pair completed` as the only account of a failure, so a
+            # dead harness and a method that does not apply to this file read identically —
+            # the same defect the usefulness probe was fixed for, still in the cost path.
+            # `measure_skills` already carried the detail; this branch did not.
+            skipped.append({"file": str(path), "reason": result.get("reason"),
+                            "pairs": result.get("pairs"),
+                            "arm_errors": sorted({
+                                str(p.get("error")) for p in (result.get("pairs") or [])
+                                if p.get("error")})})
 
     return {
         "schema_version": "0.1",

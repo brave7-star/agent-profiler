@@ -30,7 +30,7 @@ import os
 EN = "en"
 ZH = "zh"
 LANGUAGES = (EN, ZH)
-# English, not Chinese: a machine whose environment says nothing is likeliest not the the owner's.
+# English, not Chinese: a machine whose environment says nothing is likeliest not the owner's.
 FALLBACK = EN
 
 _ENVIRONMENT = ("AGENT_PROFILER_LANG", "LC_ALL", "LC_MESSAGES", "LANG")

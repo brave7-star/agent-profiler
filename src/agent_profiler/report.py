@@ -675,9 +675,16 @@ def _diverged_duplicates(components: list[dict]) -> list[dict]:
         which one loaded cannot be recovered — a `Skill` call carries only {skill, args},
         and the listing's digests did not reproduce from disk with six hash algorithms
 
-    Together: the the owner cannot know which version of their own instruction is in effect.
-    Staleness is what makes that matter rather than merely untidy — one real pair here is
-    77 days apart.
+    Together: the owner cannot know which version of their own instruction is in effect.
+    Staleness is what makes that matter rather than merely untidy, and copies months apart
+    do occur in practice.
+
+    Where the copies differ in *what they instruct*, that is said too, from the stated rules
+    each one carries. Dates and byte counts only establish that the files are not the same;
+    a reader still has to open all of them to learn whether the difference matters. When one
+    copy states three checkable rules and another states none, the ambiguity is not
+    untidiness — it decides whether the agent was told the rule at all. This costs nothing:
+    it is the same free classification the `useful` link uses, read from text on disk.
 
     Identical copies are excluded: whichever loads, the bytes are the same. That is
     redundancy, not ambiguity, and reporting it would be inventing a problem.
@@ -685,6 +692,7 @@ def _diverged_duplicates(components: list[dict]) -> list[dict]:
     No specific edit is recommended. The real configuration is the object under measurement
     and stays read-only; the report's job is to say the ambiguity exists.
     """
+    from .score import stated_rules
     out = []
     for harness, roots in HARNESS_VIEWS.items():
         by_name: dict[tuple, set] = {}
@@ -712,15 +720,27 @@ def _diverged_duplicates(components: list[dict]) -> list[dict]:
                 copies.append({"path": path, "bytes": stat.st_size, "mtime": stat.st_mtime,
                                "modified": time.strftime("%Y-%m-%d",
                                                          time.localtime(stat.st_mtime)),
-                               "digest": digest})
+                               "digest": digest,
+                               # Read per copy, not per name: the whole point is that these
+                               # files may instruct differently, so one lookup on the
+                               # component would answer for an unidentified copy.
+                               "rules": stated_rules({"path": path})[1]})
             if len(copies) < 2 or len({c["digest"] for c in copies}) == 1:
                 continue
             days = int((max(c["mtime"] for c in copies)
                         - min(c["mtime"] for c in copies)) // 86400)
+            # Differing bytes are a given here; differing *instructions* are the part a
+            # reader cannot see without opening every copy.
+            rule_sets = {tuple(sorted(c["rules"])) for c in copies}
             out.append({
                 "kind": kind, "name": name, "harness": harness, "copies_total": len(copies),
                 "copies": [{k: v for k, v in c.items() if k != "mtime"} for c in copies],
                 "days_apart": days,
+                "rules_differ": len(rule_sets) > 1,
+                # The sharpest case: one copy states a checkable rule and another states
+                # none, so which file loaded decides whether the rule was given at all.
+                "some_copy_states_no_rule": (len(rule_sets) > 1
+                                             and any(not r for r in rule_sets)),
                 # Only meaningful once the copies are at least a day apart: the report prints
                 # dates, so a label derived from a sub-day mtime could not be checked against
                 # what the reader is shown.
@@ -756,11 +776,33 @@ def _duplicate_lines(diverged: list[dict]) -> list[str]:
                         zh=f"- **{item['name']}**（{item['harness']} 侧，{how}）"))
         for copy in sorted(item["copies"], key=lambda c: c["modified"], reverse=True):
             mark = (tr(en="older: ", zh="较旧：") if copy["path"] == item["stale"] else "")
+            # The rule count goes beside each path only when the copies actually disagree.
+            # Printing it on every row would read as a quality score for each file, which
+            # it is not — a file may legitimately state nothing a machine can check.
+            rules = ""
+            if item.get("rules_differ"):
+                found = len(copy.get("rules") or [])
+                rules = (tr(en=", states no checkable rule", zh="，没有声明可判定的规则")
+                         if not found else
+                         tr(en=f", states {count(found, 'checkable rule')}",
+                            zh=f"，声明了 {found} 条可判定的规则"))
             lines.append(tr(
                 en=f"  - {mark}`{copy['path']}` ({copy['modified']}, "
-                   f"{copy['bytes']:,} bytes)",
+                   f"{copy['bytes']:,} bytes{rules})",
                 zh=f"  - {mark}`{copy['path']}`"
-                   f"（{copy['modified']}，{copy['bytes']:,} 字节）"))
+                   f"（{copy['modified']}，{copy['bytes']:,} 字节{rules}）"))
+        if item.get("some_copy_states_no_rule"):
+            lines.append(tr(
+                en="  - → the copies do not instruct the same thing: one states a rule a "
+                   "machine can check and another states none, so which file loaded decides "
+                   "whether the rule was given at all.",
+                zh="  - → 这几份拷贝给的指令不一样：一份声明了机器可判定的规则，另一份一条都"
+                   "没有 —— 所以加载的是哪份，决定了这条规则到底有没有被下达。"))
+        elif item.get("rules_differ"):
+            lines.append(tr(
+                en="  - → the copies state different rules, so which one loaded changes what "
+                   "the agent was told to do.",
+                zh="  - → 这几份拷贝声明的规则不同，所以加载哪一份会改变 agent 被要求做什么。"))
     lines += ["",
               tr(en="*How to sort it out is your call — this tool does not modify your real "
                     "configuration. Byte-identical copies are not listed: those are merely "
@@ -1241,10 +1283,10 @@ def _render(data: dict) -> str:
 #
 #   fix          something in the environment is inconsistent, and nothing about value is
 #                claimed. The most actionable thing the tool can produce.
-#   investigate  a measured cost with no evidence of use. Actionable, but only the the owner
+#   investigate  a measured cost with no evidence of use. Actionable, but only the owner
 #                knows why it is installed.
 #   ask          a measured cost with heavy use and no measurable value. The tool is out of
-#                methods and needs something from the the owner to go further.
+#                methods and needs something from the owner to go further.
 #   keep         proven to change behaviour. Reassurance, not a task.
 #
 # Within a class, findings are ordered by magnitude, which is measured rather than assigned.
@@ -1559,7 +1601,7 @@ def _findings(data: dict) -> list[dict]:
                    "零调用是正常的；如果你想不起它干什么，那才是信号。"),
         })
 
-    # -- ask: out of methods, and honest about needing the the owner -------------------------
+    # -- ask: out of methods, and honest about needing the owner -------------------------
     stuck = []
     for component in components_of(data):
         links = component["links"]
@@ -1570,7 +1612,7 @@ def _findings(data: dict) -> list[dict]:
             continue
         if (component.get("next_measurement") or {}).get("achievable"):
             # A real priced measurement exists, so this belongs in the next-steps section
-            # rather than being turned into a question for the the owner.
+            # rather than being turned into a question for the owner.
             continue
         stuck.append((component, used, cost))
     # One row per *listed* name. Two installed copies of a skill are two components and one

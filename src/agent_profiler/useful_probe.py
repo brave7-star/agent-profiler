@@ -189,6 +189,12 @@ RULE_KINDS = (
             # end with", "subject should always end with"), so a few words are allowed.
             r"|(?:title|subject|first line|commit message|message)"
             r"(?:\s+\w+){0,3}\s+ends?\s+with"
+            # The imperative, which is how instruction files usually address the agent:
+            # "always end the subject line with ...". The declarative forms above all put
+            # the noun first, so this whole mood was invisible to them — and it is the more
+            # natural one to write a rule in.
+            r"|end(?:ing)?\s+(?:the|your|each|every)\s+"
+            r"(?:title|subject|first line|commit message|message)(?:\s+line)?\s+with"
             r"|(?:title|subject|标题|commit message|提交信息)[^\n]{0,24}(?:末尾|结尾))",
             text, re.I)),
         "predicate": lambda _: lambda subject, body: bool(

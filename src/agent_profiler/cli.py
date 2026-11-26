@@ -188,7 +188,7 @@ def main(argv=None):
 
     a = ap.parse_args(argv)
     # Pinned before any renderer runs. An unset flag re-reads the environment, which is what
-    # makes the the owner's machine Chinese and a fresh clone English without either asking.
+    # makes the owner's machine Chinese and a fresh clone English without either asking.
     set_lang(getattr(a, "lang", None))
 
     try:

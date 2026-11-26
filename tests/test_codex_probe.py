@@ -392,6 +392,101 @@ def test_a_flaked_arm_is_retried_rather_than_losing_the_pair():
     assert result["cost_usd"] > 0.1
 
 
+def test_a_skipped_instruction_file_keeps_why_each_arm_failed():
+    """Found on a real run: three files came back `no pair completed` and nothing else.
+
+    That one phrase covers a harness that never answered, a timeout, and a pair that ran and
+    was rejected as unsound — three situations needing three different responses. The
+    per-attempt errors were already being collected and then dropped when the skipped entry
+    was built, so the artifact was less informative than the data behind it.
+    `measure_skills` carried the detail; this path did not.
+    """
+    with _tmp() as tmp:
+        home = tmp / "home"
+        home.mkdir()
+        target = tmp / "AGENTS.md"
+        target.write_text("project rules\n", encoding="utf-8")
+
+        calls = []
+
+        def dead(home_dir, workdir, timeout):
+            calls.append(str(workdir))
+            return {"ok": False, "error": "exit 1: credentials could not be read"}
+
+        original = cp._codex_probe
+        cp._codex_probe = dead
+        try:
+            result = cp.measure_instruction_cost(target, pairs=1)
+        finally:
+            cp._codex_probe = original
+
+    assert calls, "the probe must actually have been attempted"
+    assert result["ok"] is False
+    assert result["reason"] == "no pair completed"
+    # The diagnosis has to survive into what a reader sees.
+    errors = [p.get("error") for p in result["pairs"] if p.get("error")]
+    assert errors and all("credentials" in e for e in errors), result["pairs"]
+
+
+def _instruction_probe(*, versions=("0.150.0", "0.150.0"), models=("m-a", "m-a"),
+                       tokens=(1000, 1400)):
+    """A stub for the Codex arm probe, cycling through the given builds and models."""
+    state = {"n": 0}
+
+    def stub(home, workdir, timeout):
+        i = state["n"] % len(versions)
+        armed = (workdir / "AGENTS.md").is_file()
+        state["n"] += 1
+        return {"ok": True, "input_tokens": tokens[1] if armed else tokens[0],
+                "cli_version": versions[i], "model": models[i]}
+    return stub
+
+
+def test_a_token_figure_records_the_build_and_model_that_produced_it():
+    """Found by re-running a measurement two weeks after the first one.
+
+    The same file, byte for byte, measured 25% higher — while both runs reported a pair
+    spread of 0 and `reproducible: true`. Neither artifact named a build or a model, so the
+    two figures could not be reconciled at all, and the earlier one had meanwhile been
+    quoted as settled. A token count belongs to a tokenizer; the build picks the model.
+    """
+    with _tmp() as tmp:
+        target = tmp / "AGENTS.md"
+        target.write_text("project rules\n", encoding="utf-8")
+        original = cp._codex_probe
+        cp._codex_probe = _instruction_probe()
+        try:
+            result = cp.measure_instruction_cost(target, pairs=2)
+        finally:
+            cp._codex_probe = original
+
+    assert result["ok"] is True
+    assert result["measured_under"] == {"cli_version": "0.150.0", "model": "m-a"}
+    # And the caveat has to travel with the figure, because a spread of 0 reads as
+    # stability and is only agreement inside one window.
+    assert "not stability across runs" in result["comparability"]
+
+
+def test_arms_that_ran_under_different_builds_are_flagged_not_averaged():
+    """The failure the field exists to catch: a build changing mid-measurement makes the
+    two arms incomparable, so keeping the first value seen would hide it."""
+    with _tmp() as tmp:
+        target = tmp / "AGENTS.md"
+        target.write_text("project rules\n", encoding="utf-8")
+        original = cp._codex_probe
+        cp._codex_probe = _instruction_probe(versions=("0.150.0", "0.151.0"),
+                                             models=("m-a", "m-b"))
+        try:
+            result = cp.measure_instruction_cost(target, pairs=2)
+        finally:
+            cp._codex_probe = original
+
+    under = result["measured_under"]
+    assert under["cli_version"] is None and under["model"] is None
+    assert under["mixed"]["cli_versions"] == ["0.150.0", "0.151.0"]
+    assert "not a clean measurement" in under["warning"]
+
+
 def main() -> int:
     tests = [v for k, v in sorted(globals().items()) if k.startswith("test_")]
     for test in tests:

@@ -65,7 +65,7 @@ def test_a_locale_that_names_no_language_falls_back_rather_than_matching():
 
 
 def test_nothing_in_the_environment_means_english():
-    """A machine that says nothing is likeliest not the the owner's."""
+    """A machine that says nothing is likeliest not the owner's."""
     with _env():
         assert i18n.resolve() == i18n.EN
 
