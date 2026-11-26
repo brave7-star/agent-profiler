@@ -1411,6 +1411,15 @@ def stack_cost(components: list[dict], shared: dict | None = None) -> dict:
                 entry["contributions"].append({
                     "name": component["name"], "tokens": link["value"], "shared": False,
                     "kind": component.get("kind"), "path": component.get("path"),
+                    # A project-scoped block is in the prefix only inside its own project.
+                    # Summing the blocks of *different* projects asserts a request that
+                    # loaded two projects' instructions at once, which cannot happen: you
+                    # are never in two working directories.
+                    "scope": component.get("scope"),
+                    # Whether this block was ever actually paid here. A project with no
+                    # recorded request is a real case, and naming its file as this
+                    # environment's worst case would be a worst case that never happened.
+                    "requests": link.get("requests_observed"),
                 })
             else:
                 entry["not_summable"].append({
@@ -1465,12 +1474,31 @@ def stack_cost(components: list[dict], shared: dict | None = None) -> dict:
                 "blocker": "no component of this harness has a cost in tokens per request",
             }
             continue
-        low = sum(c["tokens"] for c in entry["contributions"])
-        high = sum(c.get("tokens_max", c["tokens"]) for c in entry["contributions"])
+        # Split before summing. "Every request carries at least N" has to be true of every
+        # request, and adding two projects' instruction files made it true of none: a
+        # request made in one project does not carry the other's. The always-on blocks are
+        # the floor; the project blocks are reported separately, with the largest named,
+        # because the honest statement is "in the heaviest project it becomes M".
+        always = [c for c in entry["contributions"] if c.get("scope") != "project"]
+        per_project = sorted((c for c in entry["contributions"] if c.get("scope") == "project"),
+                             key=lambda c: -c["tokens"])
+        low = sum(c["tokens"] for c in always)
+        high = sum(c.get("tokens_max", c["tokens"]) for c in always)
+        # The heaviest block that was *actually carried*. The plain heaviest can be a file
+        # in a project with no recorded request, and naming that as this environment's worst
+        # case states a cost nobody ever paid.
+        heaviest = next((c for c in per_project if (c.get("requests") or 0) > 0), None)
         out[harness] = {
             **entry,
             "per_request_tokens_floor": low,
             "per_request_tokens_floor_high": high if high != low else None,
+            # What a request made inside a project carries on top, never added into the
+            # floor above. Each entry is an alternative to the others, not an addend.
+            "project_blocks": [{"name": c["name"], "tokens": c["tokens"],
+                                "path": c.get("path"), "requests": c.get("requests")}
+                               for c in per_project],
+            "in_heaviest_project": (low + heaviest["tokens"]) if heaviest else None,
+            "heaviest_project_block": heaviest["name"] if heaviest else None,
             "basis": "floor",
             "assumptions": [
                 tr(en="these are non-overlapping blocks of the prefix, so they are added "
@@ -1478,6 +1506,14 @@ def stack_cost(components: list[dict], shared: dict | None = None) -> dict:
                       "itself an assumption and has not been tested",
                    zh="这些是前缀里互不重叠的几块，所以相加；但「加一块不会影响另一块」"
                       "本身是假设，没有测过"),
+                *([tr(en=f"the floor is the always-on blocks only. "
+                         f"{count(len(per_project), 'project-scoped block is', 'project-scoped blocks are')} "
+                         f"excluded from it, because a request made in one project does not "
+                         f"carry another project's instructions — they are alternatives, "
+                         f"not addends",
+                      zh=f"这个下限只含常驻的那几块。另有 {len(per_project)} 块是项目级的，"
+                         f"没有算进来 —— 在一个项目里发的请求不会背上另一个项目的规范，"
+                         f"它们之间是互斥的，不能相加")] if per_project else []),
                 tr(en=f"only {count(len(entry['contributions']), 'item has', 'items have')} "
                       f"a measured tokens-per-request; the other "
                       f"{count(len(entry['unmeasured']), 'component is', 'components are')} "

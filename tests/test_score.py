@@ -583,6 +583,7 @@ def test_a_multi_harness_component_counts_only_toward_the_harness_it_was_measure
     different plugin."""
     component = _fully_evidenced(name="pw")
     component["kind"] = "mcp"
+    component["scope"] = "user"
     component["harnesses"] = ["claude_code", "codex"]
     component["links"]["cost"] = sc._link(sc.PARTIAL, evidence="x", strength="observed",
                                           value=470, unit="tokens_per_request")
@@ -1175,10 +1176,14 @@ def test_instruction_components_with_the_same_basename_are_distinguishable():
 # -- stack-level cost: answerable without per-component attribution ----------------------
 
 
-def _costed(name, harness, value, unit="tokens_per_request", status=None):
+def _costed(name, harness, value, unit="tokens_per_request", status=None, scope="user"):
     c = _fully_evidenced(name=name)
     c["harness"] = harness
     c["harnesses"] = [harness]
+    # User scope by default: these fixtures stand for always-on blocks, which is what the
+    # floor is about. A project-scoped block is only in the prefix inside its own project,
+    # so it is excluded from the floor and tested separately.
+    c["scope"] = scope
     c["links"]["cost"] = sc._link(status or sc.PARTIAL, evidence="x", strength="observed",
                                   value=value, unit=unit)
     return c
@@ -1191,6 +1196,36 @@ def test_stack_cost_never_sums_across_harnesses():
     assert out["codex"]["per_request_tokens_floor"] == 450
     assert out["claude_code"]["per_request_tokens_floor"] == 500
     assert "all" not in out and "total" not in out
+
+
+def test_the_floor_excludes_project_blocks_because_they_are_alternatives():
+    """"Every request carries at least N" has to be true of every request. Adding two
+    projects' instruction files made it true of *none*: a request is made in one working
+    directory, so it never carries both. On a real environment this overstated the floor by
+    a factor of three, and it was the report's headline number."""
+    always = _costed("CLAUDE.md (~)", "claude_code", 709)
+    one = _costed("CLAUDE.md (proj-a)", "claude_code", 1928, scope="project")
+    two = _costed("CLAUDE.md (proj-b)", "claude_code", 1991, scope="project")
+    for c, n in ((one, 983), (two, 0)):
+        c["links"]["cost"]["requests_observed"] = n
+    out = sc.stack_cost([always, one, two])["claude_code"]
+
+    assert out["per_request_tokens_floor"] == 709
+    assert [b["tokens"] for b in out["project_blocks"]] == [1991, 1928]
+    # The worst case is the heaviest block that was actually carried. `proj-b` is heavier
+    # but its project has no recorded request, so naming it would state a cost nobody paid.
+    assert out["heaviest_project_block"] == "CLAUDE.md (proj-a)"
+    assert out["in_heaviest_project"] == 709 + 1928
+    assert any("alternatives" in a or "互斥" in a for a in out["assumptions"])
+
+
+def test_a_floor_with_no_project_blocks_says_nothing_about_a_heaviest_project():
+    """Most environments have none, and inventing a worst case from an empty list is how a
+    report grows a number with nothing behind it."""
+    out = sc.stack_cost([_costed("CLAUDE.md (~)", "claude_code", 709)])["claude_code"]
+    assert out["project_blocks"] == []
+    assert out["in_heaviest_project"] is None
+    assert out["heaviest_project_block"] is None
 
 
 def test_stack_cost_counts_a_name_installed_twice_once():

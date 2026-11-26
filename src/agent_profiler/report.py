@@ -1193,6 +1193,8 @@ def _render(data: dict) -> str:
             lines.append(tr(en=f"- **{harness}: at least {total} tokens/request**",
                             zh=f"- **{harness}：至少 {total} token/次**"))
             for item in info["contributions"]:
+                if item.get("scope") == "project":
+                    continue  # listed below, as an alternative rather than an addend
                 size = f"{item['tokens']:,}" + (
                     f"–{item['tokens_max']:,}" if item.get("tokens_max") else "")
                 tag = (tr(en=f" (shared, covers {item['covers']} skills)",
@@ -1200,6 +1202,25 @@ def _render(data: dict) -> str:
                        if item["shared"] else "")
                 lines.append(tr(en=f"  - {item['name']}: {size} tokens{tag}",
                                 zh=f"  - {item['name']}：{size} token{tag}"))
+            # Indented under the harness but outside the sum, because these do not add to
+            # each other: one request is made in one project.
+            blocks = info.get("project_blocks") or []
+            if blocks:
+                lines.append(tr(
+                    en="  - *working in a project adds exactly one of these, never two:*",
+                    zh="  - *在项目里干活会再加上下面其中一个，不会同时加两个：*"))
+                for block in blocks:
+                    # A block whose project has no recorded request is a cost that exists on
+                    # disk and was never paid, which is worth more to the reader than the
+                    # arithmetic beside it.
+                    never = (block.get("requests") or 0) == 0
+                    note = tr(en="  — but no request was ever made in that project",
+                              zh="  —— 但那个项目里从没发过请求") if never else ""
+                    lines.append(tr(
+                        en=f"    - {block['name']}: {block['tokens']:,} tokens → "
+                           f"{low + block['tokens']:,}/request{note}",
+                        zh=f"    - {block['name']}：{block['tokens']:,} token → "
+                           f"每次 {low + block['tokens']:,}{note}"))
             for note in info["assumptions"]:
                 lines.append(f"  - *{note}*")
         # A harness with no summable figure must say so, or its absence reads as zero.
@@ -1743,18 +1764,36 @@ def _overhead_line(data: dict) -> list[str]:
     if not floors:
         return []
     parts = []
+    inside = []
     for harness, entry in floors:
         low = entry["per_request_tokens_floor"]
         high = entry.get("per_request_tokens_floor_high")
         span = f"{low:,}–{high:,}" if high and high != low else f"{low:,}"
         parts.append(tr(en=f"{harness} **at least {span} tokens**",
                         zh=f"{harness} **至少 {span} token**"))
-    return [tr(en="**What every request carries before you say anything**: "
-                  f"{'; '.join(parts)}. This is measured fixed-prefix blocks added "
-                  "together, and it is a floor — whatever was not measured can only push "
-                  "it up.",
-               zh=f"**每说一句话，先背多少行李**：{'；'.join(parts)}。"
-                  "这是实测的几块固定前缀相加，是下限 —— 没测到的只会让它更高。"), ""]
+        # Stated separately because it is a different claim. The floor holds for every
+        # request; this holds only inside one project, and adding the two projects' blocks
+        # into one figure described a request that cannot exist.
+        heaviest = entry.get("in_heaviest_project")
+        if heaviest:
+            inside.append(tr(
+                en=f"{harness} {heaviest:,} in `{entry['heaviest_project_block']}`",
+                zh=f"{harness} 在 `{entry['heaviest_project_block']}` 里是 {heaviest:,}"))
+    lines = [tr(en="**What every request carries before you say anything**: "
+                   f"{'; '.join(parts)}. This is measured fixed-prefix blocks added "
+                   "together, and it is a floor — whatever was not measured can only push "
+                   "it up.",
+                zh=f"**每说一句话，先背多少行李**：{'；'.join(parts)}。"
+                   "这是实测的几块固定前缀相加，是下限 —— 没测到的只会让它更高。")]
+    if inside:
+        lines += ["", tr(
+            en="Working inside a project adds that project's own instruction file. At the "
+               f"heaviest: {'; '.join(inside)}. Only one applies at a time, so the project "
+               "blocks are alternatives rather than things to add up.",
+            zh="在某个项目里干活，会再加上那个项目自己的规范文件。最重的情况："
+               f"{'；'.join(inside)}。同一时刻只有一个生效，所以项目那几块是互斥的，"
+               "不是拿来相加的。")]
+    return lines + [""]
 
 
 def _carried_lines(components: list[dict]) -> list[dict]:
