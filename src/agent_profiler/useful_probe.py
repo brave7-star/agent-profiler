@@ -88,6 +88,7 @@ import shutil
 import subprocess
 import tempfile
 import time
+from datetime import datetime, timezone
 from pathlib import Path
 
 PROBE_REPEATS = 3
@@ -130,6 +131,16 @@ CJK = re.compile(r"[一-鿿]")
 # arm that reproduces it has recited rather than applied the rule.
 EXAMPLE_TITLE = re.compile(r"^(?:feat|fix|refactor|docs|chore|test|perf)[(:]\S*.*#\d+\s*$")
 
+
+
+def _now() -> str:
+    """When this artifact was produced, in UTC.
+
+    Added because two artifacts measuring the same file disagreed and neither carried a
+    time, so the join could not show that one superseded the other — it silently kept
+    whichever record came last. A figure without a date cannot be aged out.
+    """
+    return datetime.now(timezone.utc).replace(microsecond=0).isoformat()
 
 def _title_and_body(text: str) -> tuple[str, list[str]]:
     """Split a commit message, ignoring any fencing the model wrapped around it."""
@@ -1031,6 +1042,10 @@ def measure_useful(root: str, *, repeats: int = PROBE_REPEATS, timeout: int = PR
         "root": str(base),
         "scope": "whole_environment" if whole_environment else "project",
         "read_only": True,
+        # So a later comparison can tell which figure is newer. Two artifacts
+        # measuring one file disagreed and neither carried a time, so neither
+        # could be shown to supersede the other.
+        "measured_at": _now(),
         "useful_measurements": measurements,
         "skipped": skipped,
         # Whether a whole harness failed, stated once at the top. In a real run every

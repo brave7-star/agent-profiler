@@ -43,11 +43,22 @@ import shutil
 import subprocess
 import tempfile
 import time
+from datetime import datetime, timezone
 from pathlib import Path
 
 from .core import is_excluded as _is_excluded_entity
 from .traces import SELF_PROBE_PROMPT, collect_root
 
+
+
+def _now() -> str:
+    """When this artifact was produced, in UTC.
+
+    Added because two artifacts measuring the same file disagreed and neither carried a
+    time, so the join could not show that one superseded the other — it silently kept
+    whichever record came last. A figure without a date cannot be aged out.
+    """
+    return datetime.now(timezone.utc).replace(microsecond=0).isoformat()
 
 def _is_excluded(exclusions: dict | None, name: str) -> bool:
     return _is_excluded_entity(exclusions, "mcp", name)
@@ -584,6 +595,10 @@ def evaluate_root(
         "root": str(base),
         "scope": "whole_environment" if whole_environment else "project",
         "read_only": True,
+        # So a later comparison can tell which figure is newer. Two artifacts
+        # measuring one file disagreed and neither carried a time, so neither
+        # could be shown to supersede the other.
+        "measured_at": _now(),
         "measured": measure,
         "corpus": {
             "sessions": sessions,

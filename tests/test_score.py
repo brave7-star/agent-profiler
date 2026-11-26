@@ -633,6 +633,115 @@ def test_one_evaluation_file_can_carry_both_kinds_of_cost_measurement():
     assert instruction["links"]["cost"]["unit"] == "tokens_per_request"
 
 
+def _measurement(path, tokens, *, version=None):
+    return {"file": str(path), "ok": True, "loaded": "proven", "loaded_evidence": "x",
+            "mean_tokens": tokens, "pair_spread_tokens": 0, "reproducible": True,
+            "differences": [tokens, tokens],
+            "pairs": [{"pair": 1, "difference": tokens}, {"pair": 2, "difference": tokens}],
+            **({"measured_under": {"cli_version": version, "model": "m"}} if version else {})}
+
+
+def test_two_measurements_of_one_file_that_disagree_are_not_silently_resolved():
+    """Real case, found while merging two artifacts to refresh a report.
+
+    One instruction file had been measured twice, two weeks apart, and the figures differed
+    by a quarter — each run reporting a pair spread of 0. The index was a dict comprehension,
+    so the number a reader saw depended on which record came last, and nothing said a second
+    one existed.
+
+    Precedence is unchanged (later wins); what is required is that the disagreement is
+    visible, because a spread of 0 beside a contested figure reads as settled precision.
+    """
+    with tempfile.TemporaryDirectory() as d, tempfile.TemporaryDirectory() as h:
+        root, home = Path(d), Path(h)
+        path = root / "AGENTS.md"
+        path.write_text("rules\n", encoding="utf-8")
+        scan = {"files": [{"kind": "agents_md", "path": str(path), "origin": "declared",
+                           "scope": "project", "bytes": 6}],
+                "observed": {"components": {}}, "mcp_servers": []}
+        traces = {"observed": {"sessions_collected": 2, "calls_by_tool": {}}}
+        evaluation = {"instruction_measurements": [
+            _measurement(path, 380, version="0.144.0"),
+            _measurement(path, 474, version="0.147.0"),
+        ]}
+        components = sc.build_chain(scan=scan, traces=traces, evaluation=evaluation)
+
+    instruction = next(c for c in components if c["name"].startswith("AGENTS"))
+    cost = instruction["links"]["cost"]
+    # The later figure is used, as it always was.
+    assert cost["value"] == 474
+    # And the reader is told it is contested, with both numbers.
+    assert "not settled" in cost["evidence"]
+    assert "380" in cost["evidence"] and "474" in cost["evidence"]
+    conflict = cost["conflict"]
+    assert conflict["used"] == 474
+    assert [f["mean_tokens"] for f in conflict["figures"]] == [380, 474]
+    # What each was measured under, which is the only way to act on the disagreement.
+    assert [f["measured_under"]["cli_version"] for f in conflict["figures"]] \
+        == ["0.144.0", "0.147.0"]
+    # Reported at the top level too, beside the other join problem it resembles.
+    assert sc.measurement_conflicts(evaluation)[0]["file"] == str(path)
+
+
+def test_one_file_measured_in_both_harnesses_is_two_facts_not_a_disagreement():
+    """A real environment symlinks `AGENTS.md` to `CLAUDE.md`, so the same bytes are loaded
+    by both harnesses and cost a different amount in each. The first version of the conflict
+    check called that a contradiction.
+
+    The deeper defect it exposed: resolving the path — which is what lets an artifact join
+    across a `/var` symlink — collapsed the user's own symlink too, so two components and
+    two separately paid measurements landed on one key and the Codex figure was silently
+    replaced by the Claude one.
+    """
+    with tempfile.TemporaryDirectory() as d:
+        root = Path(d)
+        target = root / "CLAUDE.md"
+        target.write_text("rules\n", encoding="utf-8")
+        link = root / "AGENTS.md"
+        link.symlink_to(target.name)
+
+        evaluation = {"instruction_measurements": [
+            dict(_measurement(link, 1723), harness="codex"),
+            dict(_measurement(target, 1928), harness="claude_code"),
+        ]}
+        assert sc.measurement_conflicts(evaluation) == []
+
+        index, _ = sc._index_measurements(
+            evaluation["instruction_measurements"], lambda v: str(Path(v).resolve()))
+        # Both measurements survive the join, which they did not before.
+        assert sorted(m["mean_tokens"] for m in index.values()) == [1723, 1928]
+        assert len(index) == 2
+
+
+def test_an_unlabelled_measurement_is_still_placed_in_its_harness():
+    """Artifacts written before the label existed must keep joining. The file's own name is
+    a sound fallback, not a guess: a CLAUDE.md is measured through Claude Code and an
+    AGENTS.md through Codex by construction."""
+    with tempfile.TemporaryDirectory() as d:
+        root = Path(d)
+        agents, claude = root / "AGENTS.md", root / "CLAUDE.md"
+        for p in (agents, claude):
+            p.write_text("rules\n", encoding="utf-8")
+        assert sc._measurement_harness({"file": str(agents)}, None) == "codex"
+        assert sc._measurement_harness({"file": str(claude)}, None) == "claude_code"
+        # An explicit label wins over the name, and a header wins over nothing.
+        assert sc._measurement_harness({"file": str(agents), "harness": "claude_code"},
+                                       None) == "claude_code"
+        assert sc._measurement_harness({"file": str(root / "other.md")},
+                                       "codex") == "codex"
+
+
+def test_the_same_file_measured_twice_with_the_same_result_is_not_a_conflict():
+    """Re-running a measurement and getting the same answer is confirmation. Reporting it
+    as a disagreement would make a reader distrust the one case that should reassure them."""
+    with tempfile.TemporaryDirectory() as d:
+        path = Path(d) / "AGENTS.md"
+        path.write_text("rules\n", encoding="utf-8")
+        evaluation = {"instruction_measurements": [
+            _measurement(path, 474), _measurement(path, 474)]}
+        assert sc.measurement_conflicts(evaluation) == []
+
+
 def test_an_empty_instruction_file_is_not_offered_a_cost_measurement():
     """Differencing an empty file once returned -3 tokens and nearly became a finding."""
     component = _fully_evidenced(name="AGENTS.md")

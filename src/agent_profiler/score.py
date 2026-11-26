@@ -569,6 +569,97 @@ def unmatched_measurements(scan: dict, evaluation: dict | None,
 INSTRUCTION_KINDS = {"claude_md": "claude_code", "agents_md": "codex"}
 
 
+def measurement_conflicts(evaluation: dict | None) -> list[dict]:
+    """Files a supplied artifact measured more than once, with different results.
+
+    Exposed beside `unmatched_measurements` for the same reason: a figure that quietly
+    depended on which record came last is not something a reader can check.
+    """
+    def key(value: str) -> str:
+        try:
+            return str(Path(value).resolve())
+        except OSError:
+            return value
+
+    _, conflicts = _index_measurements(
+        (evaluation or {}).get("instruction_measurements") or [], key,
+        (evaluation or {}).get("harness"))
+    return conflicts
+
+
+def _measurement_harness(measurement: dict, header: str | None) -> str | None:
+    """Which harness a measurement was taken in.
+
+    Three sources in order, because artifacts written before the label existed must keep
+    joining: the measurement's own field, then the artifact header's, then the file's own
+    name. The name is a sound last resort rather than a guess — the probe measures a
+    `CLAUDE.md` through Claude Code and an `AGENTS.md` through Codex by construction, which
+    is why there are two measure functions at all.
+    """
+    explicit = measurement.get("harness")
+    if explicit:
+        return explicit
+    if header:
+        return header
+    name = Path(measurement.get("file") or "").name.lower()
+    if name == "claude.md":
+        return "claude_code"
+    if name == "agents.md":
+        return "codex"
+    return None
+
+
+def _index_measurements(measurements: list[dict], key,
+                        header: str | None = None) -> tuple[dict, list[dict]]:
+    """Index measurements by resolved path, reporting any file measured twice differently.
+
+    This was a dict comprehension, so a second measurement of the same file silently
+    replaced the first and the figure a reader saw depended on list order. That is not
+    hypothetical: re-running the probe produced a figure 25% different from the stored one
+    for an unchanged file, and merging the two artifacts would have shown one of them with
+    nothing said about the other.
+
+    Precedence stays "later wins", which is what the comprehension already did — the change
+    is that it is now visible. Nothing here guesses which is right: artifacts carry no
+    timestamp, so "newer" is not recoverable from their contents, and picking the larger or
+    the smaller would be inventing a rule. Both figures are reported with what each was
+    measured under, and the reader decides whether to re-measure.
+    """
+    out: dict[tuple, dict] = {}
+    conflicts: list[dict] = []
+    for measurement in measurements:
+        path = measurement.get("file")
+        if not path:
+            continue
+        # Keyed by path *and* harness. Resolving the path is what lets an artifact and a
+        # scan agree across a `/var` symlink, but it also collapses a user's own symlink:
+        # one real environment points AGENTS.md at CLAUDE.md, so two components and two
+        # separately paid measurements landed on one key and the Codex figure was
+        # overwritten by the Claude one. Two harnesses reading the same bytes is two facts.
+        resolved = (key(path), _measurement_harness(measurement, header))
+        previous = out.get(resolved)
+        if previous is not None:
+            before, after = previous.get("mean_tokens"), measurement.get("mean_tokens")
+            if before != after:
+                conflicts.append({
+                    "file": path,
+                    "harness": _measurement_harness(measurement, header),
+                    "figures": [
+                        {"mean_tokens": before,
+                         "measured_under": previous.get("measured_under")},
+                        {"mean_tokens": after,
+                         "measured_under": measurement.get("measured_under")},
+                    ],
+                    "used": after,
+                    "reason": "the same file was measured twice with different results; the "
+                              "later artifact is used. A token figure holds for the build "
+                              "and model that produced it, and these artifacts carry no "
+                              "timestamp, so neither can be shown to supersede the other.",
+                })
+        out[resolved] = measurement
+    return out, conflicts
+
+
 def _instruction_label(path: str) -> str:
     """A basename alone is ambiguous across scopes; add the parent directory when needed."""
     p = Path(path)
@@ -628,9 +719,10 @@ def _instruction_components(scan: dict, traces: dict, evaluation: dict | None,
         except OSError:
             return value
 
-    measured = {_key(m["file"]): m
-                for m in ((evaluation or {}).get("instruction_measurements") or [])
-                if m.get("file")}
+    measured, conflicts = _index_measurements(
+        (evaluation or {}).get("instruction_measurements") or [], _key,
+        (evaluation or {}).get("harness"))
+    conflict_by_path = {(_key(c["file"]), c.get("harness")): c for c in conflicts}
     useful_measured = {_key(m["file"]): m
                        for m in ((useful or {}).get("useful_measurements") or [])
                        if m.get("file")}
@@ -643,7 +735,10 @@ def _instruction_components(scan: dict, traces: dict, evaluation: dict | None,
         path = item["path"]
         harness = INSTRUCTION_KINDS[kind]
         record = instructions.get(path)
-        measurement = measured.get(_key(path))
+        # The harness is part of the key: a symlinked AGENTS.md -> CLAUDE.md is two
+        # components, each measured in its own harness, and the Codex figure used to
+        # be overwritten by the Claude one.
+        measurement = measured.get((_key(path), harness))
 
         if record:
             loaded = _link(PROVEN,
@@ -666,14 +761,23 @@ def _instruction_components(scan: dict, traces: dict, evaluation: dict | None,
             loaded = _unproven(f"no attachment record names this file in {sessions} sessions",
                                NOT_MEASURED)
 
+        conflict = conflict_by_path.get((_key(path), harness))
         if measurement and measurement.get("ok"):
-            cost = _link(PARTIAL,
-                         evidence=f"{measurement['mean_tokens']} tokens added to every "
-                                  f"request, measured over {len(measurement['differences'])} "
-                                  f"interleaved pair(s) with spread "
-                                  f"{measurement['pair_spread_tokens']}",
-                         strength="observed", value=measurement["mean_tokens"],
-                         unit="tokens_per_request")
+            evidence = (f"{measurement['mean_tokens']} tokens added to every "
+                        f"request, measured over {len(measurement['differences'])} "
+                        f"interleaved pair(s) with spread "
+                        f"{measurement['pair_spread_tokens']}")
+            if conflict:
+                # The spread describes agreement inside one window. Printing it next to a
+                # figure another artifact contradicts would read as settled precision.
+                others = [str(f["mean_tokens"]) for f in conflict["figures"]]
+                evidence += (f"; another supplied measurement of this file reports a "
+                             f"different figure ({' vs '.join(others)}), so this number is "
+                             f"not settled")
+            cost = _link(PARTIAL, evidence=evidence, strength="observed",
+                         value=measurement["mean_tokens"], unit="tokens_per_request")
+            if conflict:
+                cost["conflict"] = conflict
         else:
             cost = _unproven("prefix cost not measured for this file", NOT_MEASURED)
 
@@ -1662,6 +1766,10 @@ def score_root(root: str, *, profile: str | None = None, evaluation_path: str | 
         # A supplied measurement that joined to nothing. Downstream it is indistinguishable
         # from one nobody ran, so it is reported beside the components rather than dropped.
         "unmatched_measurements": orphans,
+        # Two supplied measurements of one file that disagree. The index keeps the later,
+        # which is what it always did — what is new is saying so, because the figure a
+        # reader saw used to depend on the order of a list.
+        "measurement_conflicts": measurement_conflicts(evaluation),
         # History is filed by working directory, so a moved project reads as having none.
         # Passing the collector's finding through keeps a zero from looking like a fact.
         "relocation_candidates": (traces["observed"].get("relocation_candidates") or []),

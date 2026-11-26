@@ -46,6 +46,7 @@ import time
 from pathlib import Path
 
 from .core import _user_tree
+from datetime import datetime, timezone
 
 PROBE_PROMPT = "Say: X"
 PROBE_PAIRS = 2
@@ -67,6 +68,16 @@ ARM_AGREEMENT = 0.5
 ARM_RETRIES = 2
 ARM_RETRY_DELAY = 5
 
+
+
+def _now() -> str:
+    """When this artifact was produced, in UTC.
+
+    Added because two artifacts measuring the same file disagreed and neither carried a
+    time, so the join could not show that one superseded the other — it silently kept
+    whichever record came last. A figure without a date cannot be aged out.
+    """
+    return datetime.now(timezone.utc).replace(microsecond=0).isoformat()
 
 def _reproducible(diffs: list[int], spread: int) -> bool | None:
     """Whether the figure repeated, or `None` when only one pair survived.
@@ -264,6 +275,11 @@ def measure_instruction_cost(instruction_file: Path, *, pairs: int = PROBE_PAIRS
     spread = max(diffs) - min(diffs)
     common = {
         "file": str(instruction_file),
+        # Named on the measurement, not only in the artifact's header. One real environment
+        # symlinks AGENTS.md to CLAUDE.md, so the same bytes are measured once per harness
+        # and the two figures legitimately differ — and without this label a join cannot
+        # tell that apart from one file measured twice with contradictory results.
+        "harness": "codex",
         "bytes": size_bytes,
         "characters": len(content),
         "pairs": measured_pairs,
@@ -718,6 +734,10 @@ def measure_skills(root: str, *, pairs: int = PROBE_PAIRS, timeout: int = 420,
         "root": str(base),
         "scope": "whole_environment" if whole_environment else "project",
         "read_only": True,
+        # So a later comparison can tell which figure is newer. Two artifacts
+        # measuring one file disagreed and neither carried a time, so neither
+        # could be shown to supersede the other.
+        "measured_at": _now(),
         "harness": "claude_code",
         "skill_measurements": measurements,
         "profiler_cost": {
@@ -789,6 +809,10 @@ def measure_instructions(root: str, *, pairs: int = PROBE_PAIRS, timeout: int = 
         "root": str(base),
         "scope": "whole_environment" if whole_environment else "project",
         "read_only": True,
+        # So a later comparison can tell which figure is newer. Two artifacts
+        # measuring one file disagreed and neither carried a time, so neither
+        # could be shown to supersede the other.
+        "measured_at": _now(),
         "harness": "codex",
         "instruction_measurements": measurements,
         "skipped": skipped,
