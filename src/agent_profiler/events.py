@@ -25,6 +25,15 @@ the invariant instead: `input_fresh + input_cached + input_cache_write == input_
 
 - Claude Code writes one record per content block, repeating `message.usage`; usage is
   taken once per `message.id`, and `api-request-blob` replays are not activity.
+
+  The repeats are not always identical. A transcript can record a response *as it streams*,
+  so the early copies carry a partial `output_tokens` that grows — 1, then 3, then the real
+  figure. Taking the first copy, which is what counting-once used to mean, reported the
+  partial one. The settled copy is the one whose usage carries the completion fields
+  (`iterations`, `output_tokens_details`), so that is the copy used, and a message whose
+  copies all lack them falls back to the first. Rare in the corpus this was found in and
+  worth a fraction of a percent of output tokens there, but wrong in a direction that gets
+  worse the more a harness streams.
 - Codex reports cumulative totals alongside per-response ones: `turn_token_usage` exceeded
   the per-response total in almost every record sampled, and `event_msg/token_count` carries a
   session-cumulative `total_token_usage`. Only `token_usage_record.usage` is per-response,
@@ -220,10 +229,23 @@ def _event(seq: int, etype: str, harness: str, ts, source: Path, line: int, reco
 # --------------------------------------------------------------------------------------
 
 
+# A response's usage is repeated on every record of that response, and while it streams the
+# repeats differ: `output_tokens` grows toward the real figure. These fields appear only once
+# the response is complete, which is what tells a settled copy from a partial one.
+SETTLED_USAGE_FIELDS = ("iterations", "output_tokens_details")
+
+
+def _usage_is_settled(usage: dict) -> bool:
+    return any(field in usage for field in SETTLED_USAGE_FIELDS)
+
+
 def _claude_events(path: Path) -> Iterator[dict]:
     seq = 0
     emitted_session = False
-    seen_messages: set[str] = set()
+    settled_messages: set[str] = set()
+    # Responses seen only as partial copies so far, held back in case a settled copy follows.
+    # Keyed by `message.id`, holding the fields the event would be built from.
+    partial_messages: dict[str, dict] = {}
     seen_tool_calls: set[str] = set()
     tool_of_call: dict[str, str] = {}
     request_ts: dict[str, datetime] = {}
@@ -318,24 +340,21 @@ def _claude_events(path: Path) -> Iterator[dict]:
             msg_id = message.get("id")
             usage = message.get("usage")
             # One response is written as several records; usage belongs to the response.
-            if isinstance(usage, dict) and not (isinstance(msg_id, str) and msg_id in seen_messages):
-                if isinstance(msg_id, str):
-                    seen_messages.add(msg_id)
+            if isinstance(usage, dict) and not (isinstance(msg_id, str) and msg_id in settled_messages):
                 ref = obj.get("requestRef")
                 started = request_ts.get(ref) if isinstance(ref, str) else None
                 latency = None
                 if started is not None and ts is not None:
                     delta = (ts - started).total_seconds()
                     latency = round(delta, 3) if delta >= 0 else None
-                seq += 1
-                yield _event(
-                    seq, "model_response", "claude_code", ts, path, line_no, rtype,
-                    response_id=msg_id,
-                    model=message.get("model"),
-                    stop_reason=message.get("stop_reason"),
-                    incomplete=message.get("stop_reason") is None,
-                    latency_seconds=latency,
-                    tokens=_tokens(
+                held = {
+                    "ts": ts, "line_no": line_no, "rtype": rtype,
+                    "response_id": msg_id,
+                    "model": message.get("model"),
+                    "stop_reason": message.get("stop_reason"),
+                    "incomplete": message.get("stop_reason") is None,
+                    "latency_seconds": latency,
+                    "tokens": _tokens(
                         # Anthropic bills these three separately, so the input side is their sum.
                         input_total=(
                             int(usage.get("input_tokens") or 0)
@@ -347,7 +366,26 @@ def _claude_events(path: Path) -> Iterator[dict]:
                         output=int(usage.get("output_tokens") or 0),
                         reasoning=None,
                     ),
-                )
+                }
+                # The records of one response are contiguous, so reaching a different
+                # response settles the matter for the one before it: whatever was held for it
+                # is the best figure the transcript has. Flushing here rather than at the end
+                # of the file keeps `seq` in the order the records were written.
+                for other in [i for i in partial_messages if i != msg_id]:
+                    seq += 1
+                    yield _model_response(seq, path, partial_messages.pop(other))
+                # A settled copy ends the matter and supersedes any partial one held for this
+                # response. A partial copy is held rather than emitted, because emitting it
+                # would publish a growing figure as the final one; an id-less response cannot
+                # be grouped at all, so it is emitted as it stands.
+                if _usage_is_settled(usage) or not isinstance(msg_id, str):
+                    if isinstance(msg_id, str):
+                        settled_messages.add(msg_id)
+                        partial_messages.pop(msg_id, None)
+                    seq += 1
+                    yield _model_response(seq, path, held)
+                elif msg_id not in partial_messages:
+                    partial_messages[msg_id] = held
 
             for block in blocks if isinstance(blocks, list) else []:
                 if not isinstance(block, dict) or block.get("type") != "tool_use":
@@ -373,6 +411,20 @@ def _claude_events(path: Path) -> Iterator[dict]:
                     mcp_servers_called=_mcp_servers_called(name, block.get("input")),
                     input_digest=_digest(block.get("input")),
                 )
+
+    # The last response, if its copies never settled and no later one flushed it. A partial
+    # figure is still the only figure the transcript has, so dropping it would lose the
+    # response entirely.
+    for held in list(partial_messages.values()):
+        seq += 1
+        yield _model_response(seq, path, held)
+
+
+def _model_response(seq: int, path: Path, held: dict) -> dict:
+    """Build the held response event, numbered at the point it is actually emitted."""
+    fields = {k: v for k, v in held.items() if k not in ("ts", "line_no", "rtype")}
+    return _event(seq, "model_response", "claude_code", held["ts"], path,
+                  held["line_no"], held["rtype"], **fields)
 
 
 # --------------------------------------------------------------------------------------

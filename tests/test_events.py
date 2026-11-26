@@ -33,8 +33,11 @@ def _claude_records():
         d = dict(base)
         d.update(kw)
         return d
+    # `output_tokens_details` is on essentially every real record, and it is what marks the
+    # usage as settled rather than mid-stream. A fixture without it is not the real shape.
     usage = {"input_tokens": 10, "cache_read_input_tokens": 1000,
-             "cache_creation_input_tokens": 100, "output_tokens": 50}
+             "cache_creation_input_tokens": 100, "output_tokens": 50,
+             "output_tokens_details": {"thinking_tokens": 0}}
     msg = {"id": "msg_1", "role": "assistant", "model": "claude-opus-5-5",
            "stop_reason": "tool_use", "usage": usage}
     return [
@@ -96,7 +99,7 @@ def _codex_records():
 
 
 @contextmanager
-def _env(*, claude=True, codex=True, codex_records=None):
+def _env(*, claude=True, codex=True, codex_records=None, claude_records=None):
     with tempfile.TemporaryDirectory() as d, tempfile.TemporaryDirectory() as h:
         root, home = Path(d), Path(h)
         paths = {}
@@ -105,7 +108,8 @@ def _env(*, claude=True, codex=True, codex_records=None):
             cdir = home / ".claude" / "projects" / key
             cdir.mkdir(parents=True)
             p = cdir / f"{CLAUDE_SESSION}.jsonl"
-            p.write_text("\n".join(json.dumps(r) for r in _claude_records()) + "\n", encoding="utf-8")
+            p.write_text("\n".join(json.dumps(r) for r in (claude_records or _claude_records()))
+                         + "\n", encoding="utf-8")
             paths["claude"] = p
         if codex:
             xdir = home / ".codex" / "sessions" / "2026" / "11" / "18"
@@ -182,6 +186,69 @@ def test_claude_block_split_and_replays_collapse():
         assert len(_by_type(r, "model_response")) == 1
         assert len(_by_type(r, "tool_call")) == 1
         assert r["observed"]["tokens"]["input_total"] == 1110
+
+
+def _streamed_records(*copies):
+    """One response written as several records, each copy's usage given as passed."""
+    base = {"sessionId": CLAUDE_SESSION, "version": "2.1.232", "cwd": "/proj"}
+    out = [dict(base, type="user", timestamp="2026-11-18T10:00:00.000Z",
+                message={"role": "user", "content": [{"type": "text", "text": "go"}]})]
+    for index, usage in enumerate(copies):
+        out.append(dict(base, type="assistant", apiBlockIndex=index,
+                        timestamp="2026-11-18T10:00:0%d.000Z" % (index + 1),
+                        message={"id": "msg_s", "role": "assistant", "stop_reason": "end_turn",
+                                 "model": "claude-opus-5-5", "usage": usage}))
+    return out
+
+
+def _partial(output):
+    return {"input_tokens": 2, "cache_read_input_tokens": 0,
+            "cache_creation_input_tokens": 500, "output_tokens": output}
+
+
+def _settled(output):
+    return dict(_partial(output), output_tokens_details={"thinking_tokens": 0},
+                iterations=[{"type": "message", "output_tokens": output}])
+
+
+def test_a_response_recorded_while_it_streams_reports_the_settled_total():
+    """Counting once per message id used to mean counting the *first* copy.
+
+    A real transcript wrote one response three times as it streamed, each copy carrying a
+    larger `output_tokens` than the last. The first copy said 1 where the response was 315,
+    so counting-once reported a figure two orders of magnitude under the truth.
+    """
+    with _env(codex=False, claude_records=_streamed_records(
+            _partial(1), _partial(3), _settled(315))) as (_root, paths):
+        r = normalize_session(str(paths["claude"]))
+        responses = _by_type(r, "model_response")
+        assert len(responses) == 1
+        assert responses[0]["tokens"]["output"] == 315
+        assert r["observed"]["tokens"]["output"] == 315
+
+
+def test_a_response_whose_copies_never_settle_is_still_counted():
+    """A partial figure is the only figure such a transcript has; dropping it loses the
+    response, and an absent response is a worse error than an understated one."""
+    with _env(codex=False, claude_records=_streamed_records(
+            _partial(7), _partial(7))) as (_root, paths):
+        r = normalize_session(str(paths["claude"]))
+        responses = _by_type(r, "model_response")
+        assert len(responses) == 1
+        assert responses[0]["tokens"]["output"] == 7
+
+
+def test_a_held_response_keeps_its_place_in_the_record_order():
+    """Held copies are flushed when the next response starts, not at end of file, so `seq`
+    stays in the order the records were written."""
+    records = _streamed_records(_partial(7)) + _streamed_records(_settled(9))
+    records[-1]["message"]["id"] = "msg_t"
+    records[-1]["timestamp"] = "2026-11-18T10:00:30.000Z"
+    with _env(codex=False, claude_records=records) as (_root, paths):
+        r = normalize_session(str(paths["claude"]))
+        assert [e["response_id"] for e in _by_type(r, "model_response")] == ["msg_s", "msg_t"]
+        stamps = [e["ts"] for e in r["events"] if e["ts"]]
+        assert stamps == sorted(stamps)
 
 
 def test_every_event_carries_a_raw_reference():

@@ -26,8 +26,9 @@ of discarding it.
 ## Property 1 — one response is written as several records
 
 An API response with multiple content blocks is written as **one record per block**. All
-such records share `message.id` and `requestId`, differ by `apiBlockIndex`, and **each
-repeats the identical `message.usage`**.
+such records share `message.id` and `requestId`, differ by `apiBlockIndex`, and **repeat
+`message.usage`** — identically in the ordinary case, and growing toward a final figure
+where the response was recorded as it streamed.
 
 Every session examined holds fewer distinct `message.id` values than usage-bearing records.
 Duplicate usage carriers are the norm, not an edge case.
@@ -40,10 +41,25 @@ Duplicate usage carriers are the norm, not an edge case.
 **Consequence:** usage must be summed once per `message.id`. Summing per record inflated
 one session's tokens by ~44%.
 
-**`message.id` is the right key, not `requestId`.** Checked explicitly: in one session 19
-distinct messages shared `requestId: null`, so de-duplicating by `requestId` would have
-discarded every token they carried. No message id was ever observed carrying two different
-usage values, so first-occurrence-wins is lossless (`first-wins == max-per-id`).
+**`message.id` is the right key, not `requestId`.** Checked explicitly: in one session the
+messages all shared `requestId: null`, so de-duplicating by `requestId` would have discarded
+every token they carried.
+
+**But first-occurrence-wins is not lossless.** This document previously said no message id
+was observed carrying two different usage values, and a sweep of every transcript on the
+machine refuted it: some responses are recorded *while they stream*, so the copies carry a
+growing `output_tokens` — a small figure, then a larger one, then the real one. Taking the
+first copy reported the smallest. The copies are not in conflict; only one of them is final,
+and the final one is identifiable because its usage carries the completion fields
+`iterations` and `output_tokens_details` that a mid-stream copy lacks.
+
+**Consequence:** the copy used is the **settled** one, not the first, falling back to the
+first where no copy is marked. `verify` now checks two things rather than one: that the
+copies never contradict each other (a figure that shrinks, or two copies both marked final,
+would mean neither can be trusted), and that where they do grow, the last one is marked. Both
+hold on this corpus; the streaming form is rare in it, and the error it caused there was a
+fraction of a percent of output tokens — but it grows with how much a harness streams, which
+is a property of the build, not of the machine.
 
 ## Property 2 — `api-request-blob` replays the request
 
