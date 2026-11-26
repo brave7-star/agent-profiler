@@ -757,13 +757,32 @@ def load_exclusions(path: str | None, root: Path | None = None) -> dict:
     What an exclusion does guarantee is that no stage reaches out to the thing: in
     particular `evaluate` never launches a probe configured with an excluded server, so
     nothing is sent to its endpoint.
+
+    **The home directory is searched as well as the root**, and that is a fix rather than a
+    convenience. The file used to be looked for at the root only, so a standing "never
+    contact this server" stopped applying the moment the root was not the directory holding
+    the file — including under `--all`, which is the scope this tool tells the reader their
+    question actually needs. A safety guarantee that lapses in the recommended scope is not
+    one, and nothing in the output said it had lapsed.
+
+    `searched` therefore lists every location consulted, so "nothing is excluded" can be
+    told apart from "no file was found". An explicitly named `--exclude-file` still wins and
+    still has to exist.
     """
+    searched = []
     chosen = Path(path).expanduser() if path else None
-    if chosen is None and root is not None:
-        default = root / EXCLUSIONS_FILENAME
-        chosen = default if default.is_file() else None
     if chosen is None:
-        return {"names": {}, "source": None, "reason": None}
+        # Root first: a per-project file is the more specific statement. The home directory
+        # carries the standing one, which is why it cannot be skipped.
+        for candidate in [d / EXCLUSIONS_FILENAME for d in (root, _user_home()) if d]:
+            if candidate in searched:
+                continue
+            searched.append(candidate)
+            if chosen is None and candidate.is_file():
+                chosen = candidate
+    if chosen is None:
+        return {"names": {}, "source": None, "reason": None,
+                "searched": [str(p) for p in searched]}
     # A path the caller named explicitly must exist: falling back to "nothing excluded"
     # would start sending traffic the user asked this tool to withhold.
     if not chosen.is_file():
@@ -787,7 +806,8 @@ def load_exclusions(path: str | None, root: Path | None = None) -> dict:
     reason = obj.get("reason")
     if reason is not None and not isinstance(reason, str):
         raise ValueError(f"{chosen}: reason must be a string")
-    return {"names": names, "source": str(chosen), "reason": reason}
+    return {"names": names, "source": str(chosen), "reason": reason,
+            "searched": [str(p) for p in searched]}
 
 
 def is_excluded(exclusions: dict | None, kind: str, name: str) -> bool:

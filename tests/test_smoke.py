@@ -437,6 +437,52 @@ def test_an_excluded_server_is_marked_and_never_dropped():
     assert marked["exclusions"]["names"]["mcp"] == ["demo-server"]
 
 
+def test_a_standing_exclusion_in_the_home_directory_still_applies_to_a_project_root():
+    """Real defect, found one command before spending money on the server it names.
+
+    The file was looked for at the scan root only, so a standing "never contact this" went
+    silent whenever the root was not the directory holding it — including under `--all`,
+    the scope this tool tells the reader their question actually needs. The probe would then
+    have connected to the excluded server, and nothing in the output said the exclusion had
+    lapsed.
+    """
+    with _env() as (root, home, _a):
+        (home / EXCLUSIONS_FILENAME).write_text(
+            json.dumps({"mcp": ["demo-server"], "reason": "standing"}), encoding="utf-8")
+        loaded = load_exclusions(None, root)
+    assert loaded["names"]["mcp"] == {"demo-server"}
+    assert loaded["reason"] == "standing"
+
+
+def test_a_project_exclusion_wins_over_the_standing_one():
+    """Both exist, and the per-project file is the more specific statement."""
+    with _env() as (root, home, _a):
+        (home / EXCLUSIONS_FILENAME).write_text(
+            json.dumps({"mcp": ["from-home"]}), encoding="utf-8")
+        (root / EXCLUSIONS_FILENAME).write_text(
+            json.dumps({"mcp": ["from-root"]}), encoding="utf-8")
+        loaded = load_exclusions(None, root)
+    assert loaded["names"]["mcp"] == {"from-root"}
+
+
+def test_finding_no_exclusions_file_is_told_apart_from_excluding_nothing():
+    """The two used to render identically, which is what let the lapse above stay invisible.
+
+    This is the project's own rule applied to its one outward-facing stage: an omission a
+    reader cannot see is worse than the omission.
+    """
+    with _env() as (root, _home, _a):
+        empty = load_exclusions(None, root)
+        assert empty["source"] is None
+        assert empty["searched"], "a run that found nothing must say where it looked"
+        assert all(p.endswith(EXCLUSIONS_FILENAME) for p in empty["searched"])
+
+        (root / EXCLUSIONS_FILENAME).write_text(json.dumps({"mcp": []}), encoding="utf-8")
+        declared = load_exclusions(None, root)
+    assert declared["source"] is not None
+    assert declared["names"].get("mcp") == set()
+
+
 def test_a_named_exclusions_file_that_is_missing_is_an_error():
     """Falling back to "nothing excluded" would start sending traffic the user asked this
     tool to withhold, which is the one failure here that must not be silent."""

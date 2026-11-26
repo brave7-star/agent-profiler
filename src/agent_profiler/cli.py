@@ -55,7 +55,8 @@ def _exclusions_for(a, root=None):
         merged.setdefault("mcp", set()).update(named)
         sources = [s for s in (loaded["source"], "--exclude") if s]
         loaded = {"names": merged, "source": " + ".join(sources),
-                  "reason": loaded["reason"] or "excluded on the command line"}
+                  "reason": loaded["reason"] or "excluded on the command line",
+                  "searched": loaded.get("searched") or []}
     return loaded
 
 

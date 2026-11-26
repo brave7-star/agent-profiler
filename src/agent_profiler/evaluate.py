@@ -445,6 +445,11 @@ def evaluate_root(
 
     With `measure=False` (the default) nothing is spent: the report shows what would be
     measured, what it would cost, and whether the gate approves it.
+
+    Passing no `exclusions` means "find them", not "there are none". This is the only stage
+    that opens a connection to someone else's endpoint, so the default has to be the
+    cautious one: a caller who simply forgot the argument would otherwise probe every
+    declared server, including one the user had written down as off limits.
     """
     if not root or not root.strip():
         raise ValueError("root must not be empty")
@@ -454,6 +459,10 @@ def evaluate_root(
 
     started = time.perf_counter()
     from .core import inspect as inspect_stack
+    from .core import load_exclusions
+
+    if exclusions is None:
+        exclusions = load_exclusions(None, base)
 
     scan = inspect_stack(str(base), exclusions=exclusions,
                          whole_environment=whole_environment)
@@ -584,6 +593,17 @@ def evaluate_root(
                         "measurement of zero."} if not sessions else {}),
         },
         **({"relocation_candidates": relocation} if relocation else {}),
+        # This is the one stage that contacts a third party, so what it was told to leave
+        # alone belongs in its own record. `searched` matters most when nothing was found:
+        # a standing exclusion that silently did not apply used to be indistinguishable
+        # here from a user who never asked for one, and a run with `--all` looked the same
+        # either way while the probe went ahead and connected.
+        "exclusions": {
+            "source": (exclusions or {}).get("source"),
+            "searched": (exclusions or {}).get("searched") or [],
+            "reason": (exclusions or {}).get("reason"),
+            "mcp": sorted((exclusions or {}).get("names", {}).get("mcp") or []),
+        },
         "evaluations": evaluations,
         "behavioural_ab_reference": _behavioural_ab_estimate(
             sessions, responses, observed["tokens"]["total_tokens"]

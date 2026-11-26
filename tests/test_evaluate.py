@@ -408,6 +408,51 @@ def test_an_uncalled_server_is_not_turned_into_a_removal_recommendation():
         assert "depends on work these sessions did not cover" in entry["interpretation"]
 
 
+def test_the_artifact_records_what_it_was_told_to_leave_alone():
+    """This is the one stage that connects to a third party, so the instruction not to has
+    to be in its record — including when no instruction was found.
+
+    Written after a standing exclusion silently stopped applying and the artifact looked
+    identical either way: the server simply read `not_measured`, exactly as it would for a
+    user who never asked for one.
+    """
+    from agent_profiler.core import load_exclusions
+
+    with _env(_trace_with(["mcp__s__go"]), {"s": {"command": "x"}}) as (root, calls):
+        bare = evaluate_root(str(root), measure=False)
+        assert bare["exclusions"]["source"] is None
+        assert bare["exclusions"]["mcp"] == []
+        # Where it looked, so silence is attributable rather than ambiguous.
+        assert bare["exclusions"]["searched"]
+
+        (Path(root) / "agent-profiler-exclude.json").write_text(
+            json.dumps({"mcp": ["s"], "reason": "private"}), encoding="utf-8")
+        held = evaluate_root(str(root), measure=True,
+                             exclusions=load_exclusions(None, Path(root)))
+    assert held["exclusions"]["mcp"] == ["s"]
+    assert held["exclusions"]["reason"] == "private"
+    entry = next(e for e in held["evaluations"] if e["server"] == "s")
+    assert entry["status"] == "excluded_by_request"
+    # And the guarantee itself: measure=True, yet nothing was launched for that server.
+    assert calls == [], calls
+
+
+def test_omitting_the_exclusions_argument_means_find_them_not_ignore_them():
+    """A caller who forgets the argument must not start sending traffic the user withheld.
+
+    `exclusions=None` used to mean "nothing is excluded", which is the dangerous reading of
+    a missing argument on the one stage that contacts a third party.
+    """
+    with _env(_trace_with(["mcp__s__go"]), {"s": {"command": "x"}}) as (root, calls):
+        (Path(root) / "agent-profiler-exclude.json").write_text(
+            json.dumps({"mcp": ["s"], "reason": "private"}), encoding="utf-8")
+        r = evaluate_root(str(root), measure=True)  # deliberately no exclusions passed
+    assert r["exclusions"]["mcp"] == ["s"]
+    assert next(e for e in r["evaluations"] if e["server"] == "s")["status"] \
+        == "excluded_by_request"
+    assert calls == [], calls
+
+
 def test_dry_mode_spends_nothing():
     with _env(_trace_with(["mcp__s__go"]), {"s": {"command": "x"}}) as (root, calls):
         r = evaluate_root(str(root), measure=False)
