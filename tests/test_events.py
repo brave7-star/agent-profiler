@@ -853,6 +853,23 @@ def test_an_unwritable_cache_does_not_fail_the_run():
     assert corrupt["reuse"]["sessions_reused"] == 0
 
 
+def test_the_codex_request_count_is_also_split_by_the_directory_it_ran_in():
+    """A project-scoped AGENTS.md is carried only by requests made inside that project, so
+    the requests have to be attributable to a directory. Without the split, the only
+    multiplier on offer is the environment total, which charges one project's instructions
+    to every request ever made — and the split must still sum to that total, or one of the
+    two figures is wrong."""
+    from agent_profiler.events import codex_shared_context
+
+    with _env(claude=False, codex=True) as (root, _paths):
+        out = codex_shared_context(None, use_cache=False)
+    by_cwd = out["requests_by_cwd"]
+    assert sum(by_cwd.values()) == out["requests"]
+    # The fixture's session records its cwd, so the requests land under a real directory
+    # rather than an empty key.
+    assert list(by_cwd) == [str(root.resolve())]
+
+
 def test_both_codex_rollups_come_from_one_pass_over_the_rollouts():
     """`report._collect` promises the deterministic stages run "once each", and collected
     the whole Codex corpus twice, at tens of seconds a pass. The two rollups now share a

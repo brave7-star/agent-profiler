@@ -438,6 +438,64 @@ def build_chain(*, scan: dict, traces: dict, evaluation: dict | None = None,
     return components
 
 
+def _claude_requests_by_cwd(traces: dict) -> dict:
+    """Requests per directory, from the per-project breakdown `collect` already keeps.
+
+    Only present on a whole-environment collect; a single-root one has nothing to split, and
+    for that case the environment total *is* the project total.
+    """
+    out: dict[str, int] = {}
+    for entry in ((traces.get("observed") or {}).get("by_project") or {}).values():
+        cwd = entry.get("recorded_cwd")
+        if isinstance(cwd, str):
+            out[cwd] = out.get(cwd, 0) + (entry.get("assistant_messages") or 0)
+    return out
+
+
+def _requests_elsewhere(by_directory: dict, directory: Path) -> list[dict]:
+    """Requests recorded for a same-named project at a *different* path.
+
+    Transcripts are filed by working directory, so moving a project leaves its history under
+    the old path. Attributing a project-scoped file by its current path alone then reports a
+    small figure, or zero, for a file that was carried by thousands of requests — the
+    "clean-looking answer that is wrong" the relocation check already warns about, which is
+    switched off for a whole-environment pass because nothing is lost for *discovery*.
+    Attribution is a different question, and there it does matter.
+
+    These are reported beside the figure and never added to it. A directory with the same
+    final segment is a reason to ask, not proof that two paths are one project, and this
+    function cannot tell a move from two unrelated projects that happen to share a name.
+    """
+    out = []
+    for cwd, n in sorted(by_directory.items(), key=lambda kv: -(kv[1] or 0)):
+        candidate = Path(cwd)
+        if candidate == directory or not isinstance(n, int) or n <= 0:
+            continue
+        target = directory.parts
+        if candidate.parts[:len(target)] == target:
+            continue  # already counted: this is inside the project
+        if candidate.name == directory.name:
+            out.append({"cwd": cwd, "requests": n})
+    return out
+
+
+def _requests_under(by_directory: dict, directory: Path) -> int:
+    """Requests made in a directory or anywhere below it.
+
+    A project's sessions are not all recorded at its root — a session started in a
+    subdirectory records that subdirectory — so an exact match would report zero for a
+    project that was worked in every day. The containment test is on path parts rather than
+    string prefix, so `/a/b` does not swallow `/a/bc`.
+    """
+    total = 0
+    target = directory.parts
+    for cwd, n in by_directory.items():
+        parts = Path(cwd).parts
+        if parts[:len(target)] == target:
+            total += n if isinstance(n, int) else 0
+    return total
+
+
 def _attach_carried_tokens(components: list[dict], traces: dict,
                            codex_listing: dict | None) -> None:
     """Turn a per-request rate into what this environment actually carried.
@@ -459,6 +517,10 @@ def _attach_carried_tokens(components: list[dict], traces: dict,
         "claude_code": (traces.get("observed") or {}).get("assistant_messages"),
         "codex": (codex_listing or {}).get("requests"),
     }
+    by_directory = {
+        "claude_code": _claude_requests_by_cwd(traces),
+        "codex": (codex_listing or {}).get("requests_by_cwd") or {},
+    }
     for component in components:
         cost = component["links"]["cost"]
         value = cost.get("value")
@@ -478,8 +540,47 @@ def _attach_carried_tokens(components: list[dict], traces: dict,
                 zh=f"这个速率是在 {harness} 下测的，本语料没有它单独的请求数，"
                    f"乘起来会把两边的流量混在一起")
             continue
+        # A project-scoped file is only in the prefix of requests made inside that project,
+        # so the environment's total is the wrong multiplier for it. Using it charged one
+        # project's CLAUDE.md to every request in the corpus, and the largest "carried"
+        # figure in a real report belonged to a project with **no** requests at all — a file
+        # that was never loaded once, reported as the heaviest thing in the stack.
+        elsewhere: list[dict] = []
+        if component.get("scope") == "project" and component.get("path"):
+            directory = Path(component["path"]).parent
+            n = _requests_under(by_directory.get(harness) or {}, directory)
+            elsewhere = _requests_elsewhere(by_directory.get(harness) or {}, directory)
+            cost["requests_scope"] = "project"
+            cost["requests_basis"] = tr(
+                en="requests recorded in this project's own directory; the environment "
+                   "total would charge this file to sessions that never loaded it",
+                zh="只数这个项目目录下记录到的请求；用全环境的总数，会把这个文件算到"
+                   "从没载入过它的会话上")
+        else:
+            cost["requests_scope"] = component.get("scope") or "user"
         cost["requests_observed"] = n
         cost["tokens_carried"] = int(round(value * n))
+        if elsewhere:
+            # Beside the figure, never inside it: a name match is a reason to ask whether
+            # the project moved, not evidence that it did.
+            cost["requests_elsewhere"] = elsewhere
+            moved = ", ".join(f"{e['cwd']} ({e['requests']:,})" for e in elsewhere[:3])
+            cost["requests_elsewhere_note"] = tr(
+                en=f"a same-named project has history at another path, which this figure "
+                   f"excludes: {moved}. If the project moved, those requests carried this "
+                   f"file too; if they are different projects, they did not — the name is "
+                   f"all this can see",
+                zh=f"同名项目在另一个路径下还有历史，这个数字没有包含它："
+                   f"{moved}。如果是项目搬过家，那些请求也背了这个文件；如果是两个不同的项目，"
+                   f"就没有 —— 这里能看到的只有名字")
+        if n == 0:
+            # Carried nothing is a finding, not a blank. The file is installed and has a
+            # measured rate, and this corpus holds no request that ever paid it.
+            cost["carried_is_zero_because"] = tr(
+                en="no request in this corpus was made inside this project, so this file's "
+                   "measured rate was never paid here",
+                zh="本语料里没有任何请求发生在这个项目目录下，所以这个文件测出来的速率"
+                   "在这里一次都没被付过")
         # A component installed under more harnesses than the one its rate was measured
         # under is carried by traffic this figure does not include. Without the flag the
         # product reads as a total, which is the aggregation mistake this project keeps

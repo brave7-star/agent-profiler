@@ -1410,6 +1410,96 @@ def test_a_component_on_two_harnesses_measured_on_one_is_marked_a_lower_bound():
     assert cost["carried_excludes"] == ["codex"]
 
 
+def _project_carried(path, rate=1928, harness="claude_code"):
+    c = _carried([harness], harness, rate=rate)
+    c["scope"] = "project"
+    c["path"] = path
+    return c
+
+
+def _collect_by_project(by_project, total=20000):
+    """A whole-environment collect's shape: a total, and the per-project split under it."""
+    return {"observed": {"assistant_messages": total,
+                         "by_project": {f"p{i}": {"recorded_cwd": cwd,
+                                                  "assistant_messages": n}
+                                        for i, (cwd, n) in enumerate(by_project.items())}}}
+
+
+def test_a_project_scoped_file_is_carried_by_its_own_projects_requests():
+    """The environment total is the wrong multiplier for a file only in that project's
+    prefix. Using it charged one project's CLAUDE.md to every request in the corpus."""
+    c = _project_carried("/w/proj/CLAUDE.md")
+    sc._attach_carried_tokens(
+        [c], _collect_by_project({"/w/proj": 983, "/w/other": 15000}), {"requests": 8377})
+    cost = c["links"]["cost"]
+    assert cost["requests_observed"] == 983
+    assert cost["tokens_carried"] == 1928 * 983
+    assert cost["requests_scope"] == "project"
+
+
+def test_a_project_file_counts_requests_from_its_subdirectories_too():
+    """A session started below the project root records that subdirectory, so an exact
+    match would report zero for a project worked in every day."""
+    c = _project_carried("/w/proj/CLAUDE.md")
+    sc._attach_carried_tokens(
+        [c], _collect_by_project({"/w/proj": 10, "/w/proj/src": 90, "/w/project-two": 500}),
+        {"requests": 0})
+    # `/w/project-two` must not be swallowed: the containment test is on path parts, so a
+    # string prefix match would have added its 500.
+    assert c["links"]["cost"]["requests_observed"] == 100
+
+
+def test_a_project_with_no_requests_says_so_instead_of_reporting_a_small_number():
+    """The real case that exposed this: the largest `carried` figure in a report belonged to
+    a project with no requests at all — a file never loaded once, printed as the heaviest
+    thing in the stack. Zero is a finding, so it is stated rather than left as a blank."""
+    c = _project_carried("/w/unused/CLAUDE.md", rate=1991)
+    sc._attach_carried_tokens([c], _collect_by_project({"/w/proj": 983}), {"requests": 8377})
+    cost = c["links"]["cost"]
+    assert cost["requests_observed"] == 0
+    assert cost["tokens_carried"] == 0
+    assert "never" in cost["carried_is_zero_because"] or "没被付过" in cost["carried_is_zero_because"]
+
+
+def test_a_user_scoped_file_still_uses_the_whole_environments_requests():
+    """Scoping is per component: a user-scope file is in every session's prefix, so
+    narrowing it to one project would under-report it by as much as the bug over-reported."""
+    c = _carried(["claude_code"], "claude_code", rate=709)
+    c["scope"] = "user"
+    c["path"] = "/home/u/.claude/CLAUDE.md"
+    sc._attach_carried_tokens([c], _collect_by_project({"/w/proj": 983}, total=17868), {"requests": 8377})
+    assert c["links"]["cost"]["requests_observed"] == 17868
+
+
+def test_a_same_named_project_elsewhere_is_reported_beside_the_figure_not_inside_it():
+    """Transcripts are filed by working directory, so a moved project leaves its history
+    under the old path. Attributing by the current path alone reports zero for a file
+    thousands of requests carried — but a matching final path segment is a reason to ask,
+    not proof two paths are one project, so it is never added in."""
+    c = _project_carried("/w/new/proj/CLAUDE.md")
+    sc._attach_carried_tokens(
+        [c], _collect_by_project({"/w/new/proj": 983, "/w/old/proj": 6724, "/w/unrelated": 99}),
+        {"requests": 8377})
+    cost = c["links"]["cost"]
+    # Not merged: the figure stays at what this path can prove.
+    assert cost["tokens_carried"] == 1928 * 983
+    assert cost["requests_elsewhere"] == [{"cwd": "/w/old/proj", "requests": 6724}]
+    assert "/w/old/proj" in cost["requests_elsewhere_note"]
+    # A directory that shares no name is not a candidate, or this would flag everything.
+    assert all(e["cwd"] != "/w/unrelated" for e in cost["requests_elsewhere"])
+
+
+def test_a_projects_own_subdirectories_are_not_reported_as_somewhere_else():
+    """They are already inside the figure, so listing them would double the reader's count
+    of the same requests."""
+    c = _project_carried("/w/proj/CLAUDE.md")
+    sc._attach_carried_tokens(
+        [c], _collect_by_project({"/w/proj": 10, "/w/proj/nested/proj": 40}), {"requests": 0})
+    cost = c["links"]["cost"]
+    assert cost["requests_observed"] == 50
+    assert cost.get("requests_elsewhere") is None
+
+
 def test_shared_is_expanded_to_the_harnesses_that_actually_carry_it():
     """`shared` is `~/.agents`, not a harness with traffic of its own.
 

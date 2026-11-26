@@ -720,8 +720,16 @@ def _codex_extract(events: list[dict]) -> dict:
     # One model response is one request, which is the denominator an always-on prefix cost
     # has to be multiplied by to become a figure about this environment rather than a rate.
     responses = 0
+    # Where the session ran. A project-scoped AGENTS.md is carried only by the requests made
+    # inside that project, so the requests have to be attributable to a directory before a
+    # project-scoped rate can be multiplied by anything honest.
+    cwd = None
     for event in events:
         etype = event.get("type")
+        if etype == "session_start" and cwd is None:
+            value = event.get("cwd")
+            cwd = value if isinstance(value, str) else None
+            continue
         if etype == "model_response":
             responses += 1
             continue
@@ -754,6 +762,7 @@ def _codex_extract(events: list[dict]) -> dict:
         "skill_paths": dict(skill_paths),
         "skill_written": sorted(written),
         "responses": responses,
+        "cwd": cwd,
     }
 
 
@@ -768,6 +777,7 @@ class _SharedContextRollup:
         self.listed: Counter = Counter()
         self.carrying = 0
         self.responses = 0
+        self.responses_by_cwd: Counter = Counter()
 
     def feed(self, extract: dict) -> None:
         here: set[str] = set()
@@ -784,6 +794,9 @@ class _SharedContextRollup:
             self.listed[one] += 1
         self.carrying += 1 if listings else 0
         self.responses += extract.get("responses") or 0
+        cwd = extract.get("cwd")
+        if isinstance(cwd, str):
+            self.responses_by_cwd[cwd] += extract.get("responses") or 0
 
     def result(self, discovered: int, read: int) -> dict:
         return {
@@ -806,6 +819,9 @@ class _SharedContextRollup:
             # request, so a per-request rate only becomes a figure about this environment
             # once multiplied by this.
             "requests": self.responses,
+            # The same count split by the directory each session ran in, so a project-scoped
+            # rate is multiplied by its own project's traffic rather than the environment's.
+            "requests_by_cwd": dict(self.responses_by_cwd.most_common()),
             "roots": sorted(self.roots),
             "shared": True,
             "attributable": False,

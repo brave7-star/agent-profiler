@@ -1786,6 +1786,8 @@ def _carried_lines(components: list[dict]) -> list[dict]:
             "tokens_carried": carried,
             "lower_bound": bool(cost.get("carried_is_lower_bound")),
             "excludes": cost.get("carried_excludes") or [],
+            "requests_scope": cost.get("requests_scope"),
+            "requests_elsewhere": cost.get("requests_elsewhere") or [],
         })
     # A name that repeats gets its install directory, because two copies of one skill with
     # two different measured rates are otherwise the same row printed twice.
@@ -1812,15 +1814,42 @@ def _render_carried(rows: list[dict]) -> list[str]:
         lines.append(f"| {label} | "
                      f"{r['tokens_per_request']:,} | {r['requests']:,} | "
                      f"{mark}{r['tokens_carried']:,} |")
+        # Directly under its own row, because these qualify that row's figure. A
+        # project-scoped zero is a statement about this environment — the file is installed
+        # and was never paid for — and a same-named project elsewhere says the figure may be
+        # attributing a moved project's history to nothing. Collected at the end of the
+        # table instead, a reader comparing rows takes a small figure for a small file.
+        if r.get("requests_scope") != "project":
+            continue
+        if r["requests"] == 0:
+            lines.append(tr(
+                en="| ↳ carried nothing here | — | 0 | this project has no recorded "
+                   "request, so this file was never in a prefix |",
+                zh="| ↳ 在这里没搬过 | — | 0 | 这个项目没有任何记录到的请求，"
+                   "所以这个文件没进过任何前缀 |"))
+        for e in r["requests_elsewhere"][:2]:
+            lines.append(tr(
+                en=f"| ↳ same name elsewhere | — | {e['requests']:,} | recorded under "
+                   f"`{e['cwd']}`, excluded from the figure above |",
+                zh=f"| ↳ 同名项目在别处 | — | {e['requests']:,} | 记在 `{e['cwd']}` 下，"
+                   f"上面那个数字没算它 |"))
     excluded = sorted({h for r in rows for h in r["excludes"]})
     lines += ["", tr(
-        en="Rate times requests, both observed. The request count is this corpus's model "
+        en="Rate times requests, both observed. A **project**-scoped file is multiplied by "
+           "the requests recorded inside that project, not by the environment's total: "
+           "using the total charged one project's instructions to every request ever made, "
+           "and made the heaviest row in this table a file that was never loaded once. A "
+           "`↳` row is context for the row above it, not a component. The request count is "
+           "this corpus's model "
            "responses with this tool's own probe sessions removed, cross-checked by two "
            "independent walkers. Rows are not summed: one skill installed under two scopes "
            "appears twice with the same prefix, and adding those would count it twice."
            + (f" A `≥` row is carried by {', '.join(excluded)} traffic as well, at a rate "
               "nobody has measured." if excluded else ""),
-        zh="速率乘请求数，两边都是实测。请求数是本语料的模型响应数，已剔除本工具自己的"
+        zh="速率乘请求数，两边都是实测。**项目**级的文件乘的是那个项目目录下记录到的请求数，"
+           "不是全环境总数：用总数会把一个项目的规范算到有史以来每一次请求上，还会让这张表里"
+           "最重的一行变成一个从没被载入过的文件。带 `↳` 的行是上一行的补充说明，不是组件。"
+           "请求数是本语料的模型响应数，已剔除本工具自己的"
            "探针会话，并由两个独立遍历器互校。各行**不可相加**：同一个 skill 装在两个"
            "位置就出现两次，加起来等于把同一段前缀算两遍。"
            + (f" 带 `≥` 的行还会被 {'、'.join(excluded)} 的流量搬运，那边的速率没人测过。"

@@ -1127,7 +1127,10 @@ def collect_root(root: str, limit: int | None = None, *, whole_environment: bool
     instructions: dict[str, dict] = {}
     shared_chars: Counter = Counter()
     per_project: dict[str, dict] = defaultdict(
-        lambda: {"sessions": 0, "tool_calls": 0, "tokens": 0}
+        # `assistant_messages` is here because a project-scoped instruction file is carried
+        # by *this project's* requests, not by the whole environment's. Multiplying a rate by
+        # the environment total charged one project's CLAUDE.md to every request ever made.
+        lambda: {"sessions": 0, "tool_calls": 0, "tokens": 0, "assistant_messages": 0}
     )
     self_made = {"sessions": 0, "tokens": 0}
     self_made_by: Counter = Counter()
@@ -1200,6 +1203,7 @@ def collect_root(root: str, limit: int | None = None, *, whole_environment: bool
             row["project_key"] = entry["project_key"]
             row["recorded_cwd"] = entry.get("recorded_cwd")
             per_project[entry["project_key"]]["sessions"] += 1
+            per_project[entry["project_key"]]["assistant_messages"] += obs["assistant_messages"]
             per_project[entry["project_key"]]["tool_calls"] += obs["tools"]["calls_total"]
             per_project[entry["project_key"]]["tokens"] += obs["tokens"]["input_tokens"] \
                 + obs["tokens"]["cache_read_input_tokens"] \
