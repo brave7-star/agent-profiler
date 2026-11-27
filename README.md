@@ -242,11 +242,42 @@ and a report without that flag showed **no cost column at all**: the most expens
 the project, invisible by default. Producing a report with costs meant hand-merging several
 artifacts into one file.
 
-The store is append-only, one plain-JSON file per run, and `AGENT_PROFILER_STORE` overrides
+The store is append-only, using plain JSON, and `AGENT_PROFILER_STORE` overrides
 the location. Two measurements of one file are both kept: readings that disagree are a
 finding this tool reports, not a conflict to settle by recency. A report built from stored
 figures says so on its first screen, so a remembered number is never mistaken for one
 measured just now.
+
+The three `measure-*` commands save each completed component immediately. Interrupting a
+later probe preserves the earlier results. Add `--resume` to continue without measuring
+unchanged components again:
+
+```bash
+./bin/agent-profiler measure-instructions --root PATH --all --resume
+./bin/agent-profiler measure-skills --root PATH --all --resume
+./bin/agent-profiler measure-useful --root PATH --all --resume
+```
+
+Resume matches the path, content fingerprint, harness and requested pair/repeat count.
+For a skill, the fingerprint includes its supporting files. A completed experiment that
+found no behavioural separation is kept too. Older artifacts without a fingerprint cannot
+establish that the content is unchanged and are measured again. Resume does not certify
+that today's model or provider is unchanged; omit `--resume` when a fresh reading is wanted.
+
+Two consecutive failed component measurements stop further probes for that harness. An
+abandoned compliance batch or incompatible response routes stop it immediately; the other
+harness can continue. A checkpoint write failure stops further spending and leaves the
+completed result in the command output. Skipped targets carry the reason. An unstable
+stored measurement is marked for diagnosis when resuming, rather than silently retried.
+
+For these commands, `profiler_cost.llm_calls` counts probe invocations, including retries
+and skill presence checks, even when no usable measurement results. `known_cost_usd` is
+the reported subtotal; `unknown_cost_calls` counts invocations with no dollar figure.
+`cost_usd` is `null` if any cost is unknown, not zero. Failed attempts keep their details
+in the command's `skipped` output; they are not stored as measurements. Resume reports only
+this invocation's spending. Compliance `probes_attempted` still counts arm outcomes after
+retry, so use `llm_calls` for the invocation count. A skill with no scorable rule is skipped
+before even its presence check.
 
 ### Overriding what it uses
 
@@ -344,7 +375,7 @@ while the bytecode ran another.
 for f in tests/test_*.py; do PYTHONPATH=src python3 -B "$f"; done
 ```
 
-507 regression tests, each pinned to a defect or a format property observed in a real run
+530 regression tests, each pinned to a defect or a format property observed in a real run
 rather than to a hypothetical. No test spends a token.
 
 ## Format notes

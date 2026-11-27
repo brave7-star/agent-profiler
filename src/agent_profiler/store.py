@@ -15,7 +15,7 @@ reinvent.
 So a measurement is written here as well as to stdout, and `report` reads this directory
 unless told otherwise. The design follows from what the data is:
 
-* **Append-only, one file per run.** A measurement is an observation with a timestamp, not
+* **Append-only, one file per saved artifact.** A measurement is an observation with a timestamp, not
   a current value. Overwriting would discard the earlier reading, and two readings that
   disagree are a *finding* this project already reports rather than a conflict to resolve by
   recency.

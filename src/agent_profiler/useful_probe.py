@@ -91,6 +91,8 @@ import time
 from datetime import datetime, timezone
 from pathlib import Path
 
+from .probe_cost import ProbeCost
+
 PROBE_REPEATS = 3
 RETRY_BUDGET = 3
 # Named so a test can zero it. The flake clusters in time, so an immediate retry is
@@ -302,7 +304,7 @@ def _probe(prompt: str, workdir: Path, instruction: Path | None, timeout: int,
                               cwd=str(workdir), env=dict(os.environ),
                               stdin=subprocess.DEVNULL)
     except subprocess.TimeoutExpired:
-        return {"ok": False, "error": "timeout", "cost_usd": 0.0}
+        return {"ok": False, "error": "timeout", "cost_usd": None}
     from .claude_result import read_result
 
     envelope, failure = read_result(done)
@@ -311,7 +313,7 @@ def _probe(prompt: str, workdir: Path, instruction: Path | None, timeout: int,
     usage = envelope.get("usage") or {}
     ctx = sum(int(usage.get(key) or 0) for key in
               ("input_tokens", "cache_read_input_tokens", "cache_creation_input_tokens"))
-    cost = float(envelope.get("total_cost_usd") or 0.0)
+    cost = envelope.get("total_cost_usd")
     if ctx < MIN_VALID_CTX:
         # The identified authentication/initialization failure class. Counting it as a task
         # failure would manufacture evidence that the component was needed.
@@ -332,10 +334,10 @@ def _codex_probe(prompt: str, home: Path, workdir: Path, timeout: int) -> dict:
         done = subprocess.run(argv, capture_output=True, text=True, timeout=timeout,
                               cwd=str(workdir), env=env, stdin=subprocess.DEVNULL)
     except subprocess.TimeoutExpired:
-        return {"ok": False, "error": "timeout", "cost_usd": 0.0}
+        return {"ok": False, "error": "timeout", "cost_usd": None}
     if done.returncode != 0:
         return {"ok": False, "error": f"exit {done.returncode}: {done.stderr.strip()[:120]}",
-                "cost_usd": 0.0}
+                "cost_usd": None}
 
     newest, newest_mtime = None, started - 1
     for path in home.rglob("rollout-*.jsonl"):
@@ -346,7 +348,7 @@ def _codex_probe(prompt: str, home: Path, workdir: Path, timeout: int) -> dict:
         if mtime >= newest_mtime:
             newest, newest_mtime = path, mtime
     if newest is None:
-        return {"ok": False, "error": "no rollout was written", "cost_usd": 0.0}
+        return {"ok": False, "error": "no rollout was written", "cost_usd": None}
 
     text, tokens = None, None
     for line in newest.read_text(errors="replace").splitlines():
@@ -367,11 +369,11 @@ def _codex_probe(prompt: str, home: Path, workdir: Path, timeout: int) -> dict:
             if isinstance(usage, dict) and usage.get("input_tokens"):
                 tokens = int(usage["input_tokens"])
     if text is None:
-        return {"ok": False, "error": "no assistant message in the rollout", "cost_usd": 0.0}
+        return {"ok": False, "error": "no assistant message in the rollout", "cost_usd": None}
     if tokens is not None and tokens > PROBE_CONTEXT_CEILING:
         return {"ok": False, "error": f"input tokens ({tokens}) exceed the ceiling; this run "
                                       "did work instead of answering the task",
-                "cost_usd": 0.0}
+                "cost_usd": None}
     # Codex reports tokens and no dollar figure, so none is invented here.
     return {"ok": True, "text": text, "ctx": tokens or 0, "cost_usd": None}
 
@@ -504,7 +506,7 @@ INSTRUCTION_HARNESS = {"claude_md": "claude_code", "agents_md": "codex"}
 
 
 def _probe_with_retry(run, prompt: str, label: str, timeout: int,
-                      spend: list[float]) -> dict:
+                      spend: ProbeCost) -> dict:
     """The auth/init flake runs near 40% and clusters in time, so a dead cell is retried.
 
     The wait between attempts goes through `RETRY_BACKOFF_SECONDS` so a test can set it to
@@ -515,8 +517,7 @@ def _probe_with_retry(run, prompt: str, label: str, timeout: int,
     last: dict = {"ok": False, "error": "no attempt"}
     for attempt in range(RETRY_BUDGET):
         result = run(prompt, label, timeout)
-        if result.get("cost_usd") is not None:
-            spend.append(result["cost_usd"])
+        spend.record(result)
         if result["ok"]:
             return result
         last = result
@@ -591,6 +592,10 @@ def measure_skill_usefulness(skill_dir: Path, *, repeats: int = PROBE_REPEATS,
     if not content.strip():
         return {"ok": False, "reason": f"{entry} is empty, so there is nothing for either "
                                        "arm to comply with"}
+    # Decide whether the text is testable before paying even for the presence check.
+    if not scorable_checks(content)[0]:
+        return _run_compliance(entry, content, _skill_arms_for(skill_dir),
+                               repeats=repeats, timeout=timeout, harness="claude_code")
     # A skill loads on a description match, so a task unrelated to its description never
     # reaches it and the two arms then differ by nothing. That result reads as "this skill
     # does not change the output" when it means "this task did not reach it" — three
@@ -604,6 +609,8 @@ def measure_skill_usefulness(skill_dir: Path, *, repeats: int = PROBE_REPEATS,
     # coincidence. Overlap also cannot be computed where the languages differ at all, and a
     # semantic judgement would need a model — the thing this module exists to avoid.
     loaded = _skill_presence(skill_dir, timeout=timeout)
+    spend = ProbeCost()
+    spend.include(loaded)
     if require_loaded and loaded.get("checked") and not loaded.get("present_in_with_arm"):
         return {
             "ok": False,
@@ -612,12 +619,15 @@ def measure_skill_usefulness(skill_dir: Path, *, repeats: int = PROBE_REPEATS,
                       f"it, so a probe would compare two arms that are the same; "
                       f"pass require_loaded=False to run it anyway",
             "skill_presence": loaded,
+            **spend.summary(),
         }
     result = _run_compliance(entry, content, _skill_arms_for(skill_dir),
                              repeats=repeats, timeout=timeout, harness="claude_code")
     # Kept on a result that did run, so a reader weighing a `no separation` can see that
     # the arm really did carry the skill.
     result["skill_presence"] = loaded
+    spend.include(result)
+    result.update(spend.summary())
     return result
 
 
@@ -645,12 +655,14 @@ def _skill_presence(skill_dir: Path, *, timeout: int) -> dict:
         plugin = _plugin_with_one_skill(tmp, skill_dir)
         run = _probe(SKILL_LIST_PROMPT, workdir, None, timeout, bare=False,
                      extra_args=("--setting-sources", "", "--plugin-dir", str(plugin)))
+    spend = ProbeCost()
+    spend.record(run)
     if not run.get("ok"):
         return {"checked": False, "error": run.get("error"),
-                "cost_usd": run.get("cost_usd") or 0.0}
+                **spend.summary()}
     listed = _listed_skills(run.get("text") or "")
     return {"checked": True, "present_in_with_arm": skill_dir.name in listed,
-             "listed": sorted(listed)[:12], "cost_usd": run.get("cost_usd") or 0.0}
+             "listed": sorted(listed)[:12], **spend.summary()}
 
 
 def _harness_health(measurements: list[dict]) -> dict:
@@ -727,7 +739,7 @@ def _run_compliance(subject: Path, content: str, build, *, repeats: int, timeout
         }
 
     examples = _example_titles(content)
-    spend: list[float] = []
+    spend = ProbeCost()
     records: list[dict] = []
 
     with tempfile.TemporaryDirectory() as raw:
@@ -802,7 +814,7 @@ def _tally(records: list[dict], task_id: str, check: str) -> dict:
 
 def _verdict(instruction_file: Path, content: str, stated: list[dict],
              not_stated: list[dict], examples: list[str], records: list[dict],
-             spend: list[float], *, harness: str, built: dict,
+             spend: ProbeCost, *, harness: str, built: dict,
              exhausted: dict | None = None) -> dict:
     failed = [r for r in records if not r["valid"]]
     caveats = [
@@ -829,10 +841,10 @@ def _verdict(instruction_file: Path, content: str, stated: list[dict],
         "abandoned": exhausted,
         # Codex reports tokens and no dollar figure. `0.0` would read as "this was free",
         # so the absence is reported as an absence.
-        "cost_usd": round(sum(spend), 4) if built["reports_cost"] else None,
+        **spend.summary(),
         "cost_note": None if built["reports_cost"] else
                      f"{harness} reports no dollar figure for a run, so none is given; "
-                     f"{len(records)} runs were made",
+                     f"{spend.calls} runs were made",
         "caveats": caveats,
     }
 
@@ -945,7 +957,8 @@ def _verdict(instruction_file: Path, content: str, stated: list[dict],
 
 
 def measure_useful(root: str, *, repeats: int = PROBE_REPEATS, timeout: int = PROBE_TIMEOUT,
-                   whole_environment: bool = False, exclusions: dict | None = None) -> dict:
+                   whole_environment: bool = False, exclusions: dict | None = None,
+                   resume: bool = False, checkpoint: bool = False) -> dict:
     """Measure `useful` for every instruction file discovered for a root.
 
     Only instruction files are covered, and the reason is no longer the arms. Both of the
@@ -987,6 +1000,11 @@ def measure_useful(root: str, *, repeats: int = PROBE_REPEATS, timeout: int = PR
                          exclusions=exclusions)
 
     measurements, skipped = [], []
+    spend = ProbeCost()
+    from .measurement_batch import MeasurementBatch
+
+    batch = MeasurementBatch(base, "measure-useful", resume=resume, checkpoint=checkpoint,
+                             parameters={"repeats": repeats})
     for item in scan.get("files") or []:
         if item.get("origin") != "declared":
             continue
@@ -1000,14 +1018,19 @@ def measure_useful(root: str, *, repeats: int = PROBE_REPEATS, timeout: int = PR
         if exclusions and is_excluded(exclusions, "instruction", path.name):
             skipped.append({"file": str(path), "reason": "excluded_by_request"})
             continue
+        digest, skip = batch.prepare(path, "useful_measurements", harness)
+        if skip:
+            skipped.append({"file": str(path), "reason": skip})
+            continue
         result = measure_instruction_usefulness(path, repeats=repeats, timeout=timeout,
                                                 harness=harness)
+        spend.include(result)
         result["file"] = str(path)
+        batch.record(result, path, "useful_measurements", harness, digest)
         if result.get("useful"):
             measurements.append(result)
         else:
-            skipped.append({"file": str(path), "reason": result.get("reason"),
-                            "blocker": result.get("blocker")})
+            skipped.append(result)
 
     # Skills, through the arm that adds exactly one back. Every install is measured, not one
     # of them: the same skill can be installed more than once with copies that differ, the
@@ -1018,22 +1041,29 @@ def measure_useful(root: str, *, repeats: int = PROBE_REPEATS, timeout: int = PR
         if exclusions and is_excluded(exclusions, "skill", directory.name):
             skipped.append({"file": str(directory), "reason": "excluded_by_request"})
             continue
+        path = directory / "SKILL.md"
+        digest, skip = batch.prepare(path, "useful_measurements", "claude_code", skill=True)
+        if skip:
+            skipped.append({"file": str(path), "reason": skip})
+            continue
         result = measure_skill_usefulness(directory, repeats=repeats, timeout=timeout)
+        spend.include(result)
         # The SKILL.md, not the directory: the cost artifact records the entry file and the
         # index that joins it to a component derives the directory from it. Recording the
         # directory here would key the two artifacts differently and this measurement would
         # join to nothing while reading as never attempted.
         result.setdefault("file", str(directory / "SKILL.md"))
         result["skill_dir"] = str(directory)
+        batch.record(result, path, "useful_measurements", "claude_code", digest, skill=True)
         if result.get("useful"):
             measurements.append(result)
         else:
-            skipped.append({"file": str(directory), "reason": result.get("reason"),
-                            "blocker": result.get("blocker")})
+            skipped.append(result)
 
     return {
         "schema_version": "0.1",
         "mode": "measure_useful",
+        **batch.summary(),
         "root": str(base),
         "scope": "whole_environment" if whole_environment else "project",
         "read_only": True,
@@ -1051,7 +1081,7 @@ def measure_useful(root: str, *, repeats: int = PROBE_REPEATS, timeout: int = PR
         "profiler_cost": {
             "stage": "measure_useful",
             "elapsed_ms": round((time.perf_counter() - started) * 1000, 1),
-            "cost_usd": round(sum(m.get("cost_usd") or 0.0 for m in measurements), 4),
+            **spend.summary(),
             "probes": sum(m.get("probes_attempted", 0) for m in measurements),
         },
         "notes": [

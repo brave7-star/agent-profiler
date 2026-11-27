@@ -37,6 +37,13 @@ def _keep(data, stage):
     """
     from .store import remember
 
+    if data.get("checkpointed"):
+        for saved in data.get("checkpoint_paths") or []:
+            print(f"kept this measurement at {saved}", file=sys.stderr)
+        if data.get("checkpoint_errors"):
+            print("could not checkpoint a measurement; further probes were stopped. "
+                  "Save this command's output to preserve the result.", file=sys.stderr)
+        return None
     path = remember(data, stage=stage)
     if path:
         print(f"kept this measurement at {path}\n"
@@ -214,6 +221,12 @@ def main(argv=None):
                          help="re-read every transcript instead of reusing a summary kept "
                               "for one whose bytes have not changed")
 
+    for name in ("measure-instructions", "measure-skills", "measure-useful"):
+        sp.choices[name].add_argument(
+            "--resume", action="store_true",
+            help="skip stored results with the same path, content, harness and probe "
+                 "parameters; older results without a content fingerprint are remeasured")
+
     a = ap.parse_args(argv)
     # Pinned before any renderer runs. An unset flag re-reads the environment, which is what
     # makes the owner's machine Chinese and a fresh clone English without either asking.
@@ -281,15 +294,18 @@ def main(argv=None):
         elif a.cmd == "measure-useful":
             data = measure_useful(a.root, repeats=a.repeats, timeout=a.timeout,
                                   whole_environment=a.whole_environment,
-                                  exclusions=_exclusions_for(a, a.root))
+                                  exclusions=_exclusions_for(a, a.root),
+                                  resume=a.resume, checkpoint=True)
             _keep(data, "measure-useful")
         elif a.cmd == "measure-skills":
             data = measure_skills(a.root, pairs=a.pairs, timeout=a.timeout,
-                                  whole_environment=a.whole_environment, only=a.only)
+                                  whole_environment=a.whole_environment, only=a.only,
+                                  resume=a.resume, checkpoint=True)
             _keep(data, "measure-skills")
         elif a.cmd == "measure-instructions":
             data = measure_instructions(a.root, pairs=a.pairs, timeout=a.timeout,
-                                        whole_environment=a.whole_environment)
+                                        whole_environment=a.whole_environment,
+                                        resume=a.resume, checkpoint=True)
             _keep(data, "measure-instructions")
         elif a.cmd == "verify":
             data = verify(limit=a.limit)

@@ -492,12 +492,13 @@ def test_the_real_skill_directory_is_untouched_by_its_own_measurement():
 
 
 def test_a_skill_stating_no_rule_is_not_probed():
-    calls = []
-    with _skill_probe(seen=calls), _tmp() as tmp:
+    def forbidden(*args, **kwargs):
+        raise AssertionError("a skill without scorable rules must not call even the listing probe")
+
+    with _skill_probe(probe=forbidden), _tmp() as tmp:
         out = up.measure_skill_usefulness(
             _skill(tmp, "# Helper\n\nUse good judgement.\n"), repeats=2)
     assert out["blocker"] == "NO_STATED_RULES"
-    assert calls == []
 
 
 def test_a_skills_own_fixture_skills_are_not_treated_as_installs():

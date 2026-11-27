@@ -45,6 +45,7 @@ import tempfile
 import time
 from pathlib import Path
 
+from .probe_cost import ProbeCost
 from .core import _user_tree
 from datetime import datetime, timezone
 
@@ -114,13 +115,19 @@ def _measured_under(arms: list[dict]) -> dict:
         out["mixed"] = {"cli_versions": versions, "models": models}
         out["warning"] = ("the arms did not all run under one build or model, so their "
                           "difference is not a clean measurement of the file")
-    # Membership is read, not truthiness: `False` is an observation and would be filtered
-    # out by `distinct`, which is the whole signal this is looking for.
-    routes = {a["reply_carries_own_turn_id"] for a in arms
-              if a.get("reply_carries_own_turn_id") is not None}
+    # Every arm must be on the route the harness asked for — not merely on the *same* route
+    # as the other arm. Two replies that both carry a foreign id agree only in being
+    # unidentified: nothing in the record says they came from the same place, so "they
+    # match" is not a property that can be established about them. Requiring agreement
+    # rather than provenance would have accepted exactly that pair.
+    #
+    # Collected as a list, not a set, because `False` is the observation being looked for
+    # and any truthiness filter drops it.
+    routes = [a["reply_carries_own_turn_id"] for a in arms
+              if a.get("reply_carries_own_turn_id") is not None]
     # `None` means the build did not stamp turns in a way this can read, which is not the
-    # same as having checked and found one route.
-    out["arms_served_alike"] = None if not routes else len(routes) == 1
+    # same as having checked and found the route sound.
+    out["arms_on_own_route"] = None if not routes else all(routes)
     return out
 
 
@@ -266,6 +273,7 @@ def measure_instruction_cost(instruction_file: Path, *, pairs: int = PROBE_PAIRS
 
     measured_pairs: list[dict] = []
     measured_arms: list[dict] = []
+    spend = ProbeCost()
     with tempfile.TemporaryDirectory() as raw:
         tmp = Path(raw)
         home = _controlled_home(tmp)
@@ -283,7 +291,26 @@ def measure_instruction_cost(instruction_file: Path, *, pairs: int = PROBE_PAIRS
                     (("without", without_dir), ("with", with_dir))
             arms: dict[str, dict] = {}
             for label, directory in order:
-                arms[label] = self_probe = _codex_probe(home, directory, timeout)
+                # An arm answered by another route is retried rather than differenced. The
+                # route is a *precondition* of the measurement, the way a working credential
+                # is, so this has the shape of the flake retry and not of an outcome filter:
+                # what is retried is a condition of the request, decided before any token
+                # figure is read.
+                #
+                # Only the harness's own route is accepted, never merely "the two arms
+                # agree". A reply carrying an id the harness never issued says it came from
+                # somewhere else, and nothing in the record identifies two such replies as
+                # having come from the *same* somewhere else. `None` is accepted because a
+                # build that does not stamp replies this way has reported nothing either way.
+                for attempt in range(ARM_RETRIES + 1):
+                    arms[label] = self_probe = _codex_probe(home, directory, timeout)
+                    spend.record(self_probe)
+                    if not self_probe["ok"]:
+                        break
+                    if self_probe.get("reply_carries_own_turn_id") is not False:
+                        break
+                    if attempt < ARM_RETRIES:
+                        time.sleep(ARM_RETRY_DELAY)
                 if not self_probe["ok"]:
                     break
             measured_arms.extend(a for a in arms.values() if a.get("ok"))
@@ -305,7 +332,8 @@ def measure_instruction_cost(instruction_file: Path, *, pairs: int = PROBE_PAIRS
 
     good = [p for p in measured_pairs if "difference" in p]
     if not good:
-        return {"ok": False, "reason": "no pair completed", "pairs": measured_pairs}
+        return {"ok": False, "reason": "no pair completed", "pairs": measured_pairs,
+                **spend.summary()}
 
     diffs = [p["difference"] for p in good]
     mean = sum(diffs) / len(diffs)
@@ -326,6 +354,7 @@ def measure_instruction_cost(instruction_file: Path, *, pairs: int = PROBE_PAIRS
         # What produced the figure, so two runs can be compared instead of merely differing.
         # A token count belongs to a tokenizer, and the build chooses the model.
         "measured_under": _measured_under(measured_arms),
+        **spend.summary(),
         "method": "a copy of the file is injected as a project AGENTS.md in a controlled "
                   "CODEX_HOME; arms alternate within one window so drift cannot read as "
                   "an effect. The real file is read, never modified.",
@@ -339,16 +368,18 @@ def measure_instruction_cost(instruction_file: Path, *, pairs: int = PROBE_PAIRS
     # any magnitude: a large one is not evidence of loading and a small one is not evidence
     # of its absence. Repeating the measurement does not address it, so this is reported as
     # a condition to fix rather than as a figure with a caveat attached.
-    if common["measured_under"].get("arms_served_alike") is False:
+    if common["measured_under"].get("arms_on_own_route") is False:
         return {
             "ok": False,
             "blocker": "ARMS_NOT_SERVED_ALIKE",
             "loaded": "unproven",
             "reason": "the arms' replies did not all carry the turn id this harness issued, "
                       "so they were not all answered by the same route; a difference "
-                      "between them measures the routes rather than the file. More pairs "
-                      "cannot fix this — point the CLI straight at the model provider, or "
-                      "establish that the relay in front of it serves every request alike.",
+                      "between them measures the routes rather than the file. Each arm was "
+                      f"retried up to {ARM_RETRIES} time(s) and the route did not settle, "
+                      "so more pairs cannot fix this — point the CLI straight at the model "
+                      "provider, or establish that whatever sits in front of it serves "
+                      "every request alike.",
             **common,
         }
     if mean <= MIN_DETECTABLE_TOKENS:
@@ -408,7 +439,7 @@ def measure_claude_instruction_cost(instruction_file: Path, *, pairs: int = PROB
                 "bytes": size_bytes, "characters": len(content)}
 
     measured_pairs: list[dict] = []
-    spend = 0.0
+    spend = ProbeCost()
     with tempfile.TemporaryDirectory() as raw:
         tmp = Path(raw)
         workdir = tmp / "work"
@@ -422,7 +453,7 @@ def measure_claude_instruction_cost(instruction_file: Path, *, pairs: int = PROB
             for label in order:
                 arms[label] = run = _probe(PROBE_PROMPT, workdir,
                                            injected if label == "with" else None, timeout)
-                spend += float(run.get("cost_usd") or 0.0)
+                spend.record(run)
                 if not run["ok"]:
                     break
             if len(arms) == 2 and all(a["ok"] for a in arms.values()):
@@ -458,7 +489,7 @@ def measure_claude_instruction_cost(instruction_file: Path, *, pairs: int = PROB
     good = [p for p in measured_pairs if "difference" in p]
     if not good:
         return {"ok": False, "reason": "no pair completed", "pairs": measured_pairs,
-                "cost_usd": round(spend, 6)}
+                **spend.summary()}
 
     diffs = [p["difference"] for p in good]
     mean = sum(diffs) / len(diffs)
@@ -472,7 +503,7 @@ def measure_claude_instruction_cost(instruction_file: Path, *, pairs: int = PROB
         "differences": diffs,
         "mean_tokens": round(mean),
         "pair_spread_tokens": spread,
-        "cost_usd": round(spend, 6),
+        **spend.summary(),
         "method": "a verbatim copy is appended with --append-system-prompt-file against a "
                   "--bare baseline; arms alternate within one window so drift cannot read "
                   "as an effect. The real file is read, never modified.",
@@ -572,7 +603,7 @@ def measure_skill_cost(skill_dir: Path, *, pairs: int = PROBE_PAIRS,
     content = entry.read_text(errors="replace")
 
     measured_pairs: list[dict] = []
-    spend = 0.0
+    spend = ProbeCost()
     with tempfile.TemporaryDirectory() as raw:
         tmp = Path(raw)
         workdir = tmp / "work"
@@ -588,7 +619,7 @@ def measure_skill_cost(skill_dir: Path, *, pairs: int = PROBE_PAIRS,
                 for attempt in range(ARM_RETRIES + 1):
                     run = _probe(SKILL_LIST_PROMPT, workdir, None, timeout,
                                  bare=False, extra_args=arm_args[label])
-                    spend += float(run.get("cost_usd") or 0.0)
+                    spend.record(run)
                     if run["ok"]:
                         break
                     if attempt < ARM_RETRIES:
@@ -629,7 +660,7 @@ def measure_skill_cost(skill_dir: Path, *, pairs: int = PROBE_PAIRS,
     if not good:
         return {"ok": False, "reason": "no pair completed with both arms verified",
                 "skill": skill_dir.name, "pairs": measured_pairs,
-                "cost_usd": round(spend, 6)}
+                **spend.summary()}
 
     diffs = [p["difference"] for p in good]
     mean = sum(diffs) / len(diffs)
@@ -645,7 +676,7 @@ def measure_skill_cost(skill_dir: Path, *, pairs: int = PROBE_PAIRS,
         "differences": diffs,
         "mean_tokens": round(mean),
         "pair_spread_tokens": spread,
-        "cost_usd": round(spend, 6),
+        **spend.summary(),
         "method": "a copy of the skill is added through --plugin-dir against a "
                   '--setting-sources "" baseline; each arm lists its own skills so the '
                   "pair proves it differs by this one, and arms alternate within one "
@@ -745,7 +776,8 @@ def _ambiguous_names(targets: list[Path]) -> dict[str, list[str]]:
 
 
 def measure_skills(root: str, *, pairs: int = PROBE_PAIRS, timeout: int = 420,
-                   whole_environment: bool = False, only: str | None = None) -> dict:
+                   whole_environment: bool = False, only: str | None = None,
+                   resume: bool = False, checkpoint: bool = False) -> dict:
     """Measure the per-request cost of each Claude Code skill discovered for a root.
 
     Skills are the largest group of components in this stack and every one of them had an
@@ -766,24 +798,37 @@ def measure_skills(root: str, *, pairs: int = PROBE_PAIRS, timeout: int = 420,
         targets = [d for d in targets if d.name == only]
 
     ambiguous = _ambiguous_names(targets)
+    from .measurement_batch import MeasurementBatch
+
+    batch = MeasurementBatch(base, "measure-skills", resume=resume, checkpoint=checkpoint,
+                             parameters={"pairs": pairs})
     measurements = []
+    spend = ProbeCost()
     for directory in targets:
+        path = directory / "SKILL.md"
+        digest, skip = batch.prepare(path, "skill_measurements", "claude_code", skill=True)
+        if skip:
+            skipped.append({"skill": directory.name, "path": str(directory), "reason": skip})
+            continue
         result = measure_skill_cost(directory, pairs=pairs, timeout=timeout)
+        spend.include(result)
         siblings = [p for p in ambiguous.get(directory.name, []) if p != str(directory)]
         if siblings:
             result["ambiguous_with"] = siblings
             result["ambiguous"] = ("this name is installed twice with different content and "
                                    "the harness lists it once, so this figure belongs to "
                                    "whichever copy is loaded — which cannot be determined")
+        batch.record(result, path, "skill_measurements", "claude_code", digest, skill=True)
         if result.get("ok") or result.get("inconclusive"):
             measurements.append(result)
         else:
             skipped.append({"skill": directory.name, "path": str(directory),
-                            "reason": result.get("reason"), "pairs": result.get("pairs")})
+                            **result})
 
     return {
         "schema_version": "0.1",
         "mode": "measure_skills",
+        **batch.summary(),
         "root": str(base),
         "scope": "whole_environment" if whole_environment else "project",
         "read_only": True,
@@ -796,8 +841,9 @@ def measure_skills(root: str, *, pairs: int = PROBE_PAIRS, timeout: int = 420,
         "profiler_cost": {
             "stage": "measure_skills",
             "elapsed_ms": round((time.perf_counter() - started) * 1000, 1),
-            "claude_runs": sum(2 * len(m.get("pairs") or []) for m in measurements),
-            "spend_usd": round(sum(float(m.get("cost_usd") or 0.0) for m in measurements), 6),
+            "claude_runs": spend.calls,
+            **spend.summary(),
+            "spend_usd": spend.summary()["cost_usd"],
         },
         "skipped": skipped,
         "notes": [
@@ -815,7 +861,8 @@ def measure_skills(root: str, *, pairs: int = PROBE_PAIRS, timeout: int = 420,
 
 
 def measure_instructions(root: str, *, pairs: int = PROBE_PAIRS, timeout: int = 420,
-                         whole_environment: bool = False) -> dict:
+                         whole_environment: bool = False, resume: bool = False,
+                         checkpoint: bool = False) -> dict:
     """Measure every instruction file discovered for a root, in the harness that loads it.
 
     Claude Code instruction *loading* is already provable from `attachment` records for
@@ -832,6 +879,12 @@ def measure_instructions(root: str, *, pairs: int = PROBE_PAIRS, timeout: int = 
     scan = inspect_stack(str(base), whole_environment=whole_environment)
 
     measurements, skipped = [], []
+    spend = ProbeCost()
+    runs = {"codex": 0, "claude_code": 0}
+    from .measurement_batch import MeasurementBatch
+
+    batch = MeasurementBatch(base, "measure-instructions", resume=resume, checkpoint=checkpoint,
+                             parameters={"pairs": pairs})
     measurers = {"agents_md": measure_instruction_cost,
                  "claude_md": measure_claude_instruction_cost}
     for item in scan.get("files") or []:
@@ -839,8 +892,16 @@ def measure_instructions(root: str, *, pairs: int = PROBE_PAIRS, timeout: int = 
         if measure is None or item.get("origin") != "declared":
             continue
         path = Path(item["path"])
+        harness = "codex" if item["kind"] == "agents_md" else "claude_code"
+        digest, skip = batch.prepare(path, "instruction_measurements", harness)
+        if skip:
+            skipped.append({"file": str(path), "reason": skip})
+            continue
         result = measure(path, pairs=pairs, timeout=timeout)
+        spend.include(result)
+        runs[harness] += result.get("llm_calls", 0)
         result["file"] = str(path)
+        batch.record(result, path, "instruction_measurements", harness, digest)
         if result.get("ok") or result.get("inconclusive"):
             measurements.append(result)
         else:
@@ -850,8 +911,7 @@ def measure_instructions(root: str, *, pairs: int = PROBE_PAIRS, timeout: int = 
             # dead harness and a method that does not apply to this file read identically —
             # the same defect the usefulness probe was fixed for, still in the cost path.
             # `measure_skills` already carried the detail; this branch did not.
-            skipped.append({"file": str(path), "reason": result.get("reason"),
-                            "pairs": result.get("pairs"),
+            skipped.append({**result,
                             "arm_errors": sorted({
                                 str(p.get("error")) for p in (result.get("pairs") or [])
                                 if p.get("error")})})
@@ -859,6 +919,7 @@ def measure_instructions(root: str, *, pairs: int = PROBE_PAIRS, timeout: int = 
     return {
         "schema_version": "0.1",
         "mode": "measure_instructions",
+        **batch.summary(),
         "root": str(base),
         "scope": "whole_environment" if whole_environment else "project",
         "read_only": True,
@@ -866,13 +927,15 @@ def measure_instructions(root: str, *, pairs: int = PROBE_PAIRS, timeout: int = 
         # measuring one file disagreed and neither carried a time, so neither
         # could be shown to supersede the other.
         "measured_at": _now(),
-        "harness": "codex",
+        "harnesses": sorted({m["harness"] for m in measurements + skipped if m.get("harness")}),
         "instruction_measurements": measurements,
         "skipped": skipped,
         "profiler_cost": {
             "stage": "measure_instructions",
             "elapsed_ms": round((time.perf_counter() - started) * 1000, 1),
-            "codex_runs": sum(2 * len(m.get("differences") or []) for m in measurements),
+            "codex_runs": runs["codex"],
+            "claude_runs": runs["claude_code"],
+            **spend.summary(),
         },
         "notes": [
             "A measured difference is Observed: content that changes the fixed prefix is "

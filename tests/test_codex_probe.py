@@ -463,7 +463,7 @@ def test_a_token_figure_records_the_build_and_model_that_produced_it():
 
     assert result["ok"] is True
     assert result["measured_under"] == {"cli_version": "0.150.0", "model": "m-a",
-                                        "arms_served_alike": None}
+                                        "arms_on_own_route": None}
     # And the caveat has to travel with the figure, because a spread of 0 reads as
     # stability and is only agreement inside one window.
     assert "not stability across runs" in result["comparability"]
@@ -532,52 +532,84 @@ def test_a_reply_carrying_a_foreign_turn_id_is_read_as_another_route():
         assert cp._rollout_run(tmp, 0)["reply_carries_own_turn_id"] is None
 
 
-def _differenced(**kw):
+def _differenced(_calls=None, **kw):
+    """Difference a fixture file against a stubbed probe, counting the arms it ran.
+
+    `time.sleep` is replaced because the retry delay is calibrated for a real harness and
+    this suite spends no wall-clock on it.
+    """
     with _tmp() as tmp:
         target = tmp / "AGENTS.md"
         target.write_text("project rules\n", encoding="utf-8")
-        original = cp._codex_probe
-        cp._codex_probe = _instruction_probe(**kw)
+        stub, original, slept = _instruction_probe(**kw), cp._codex_probe, []
+        real_sleep = cp.time.sleep
+
+        def counted(home, workdir, timeout):
+            if _calls is not None:
+                _calls.append(workdir.name)
+            return stub(home, workdir, timeout)
+
+        cp._codex_probe = counted
+        cp.time.sleep = slept.append
         try:
-            return cp.measure_instruction_cost(target, pairs=2)
+            out = cp.measure_instruction_cost(target, pairs=2)
+            out["_slept"] = slept
+            return out
         finally:
             cp._codex_probe = original
+            cp.time.sleep = real_sleep
 
 
-def test_arms_answered_by_different_routes_are_refused_not_differenced():
+def test_a_difference_from_an_unidentified_route_is_refused_not_differenced():
     """What two readings of one file that would not agree actually were.
 
-    The arms of each pair had been answered by different routes, so neither difference was
-    a reading of the file at all — the figures came from two accountings. Reporting a mean
-    and a spread described the routes. The condition is detectable from the harness's own
-    record, which makes it a refusal rather than a caveat.
+    The arms had been answered off the route the harness asked for, so neither difference
+    was a reading of the file at all — the figures came from two accountings. Reporting a
+    mean and a spread described the routes. The condition is detectable from the harness's
+    own record, which makes it a refusal rather than a caveat.
     """
-    result = _differenced(routes=(True, False))
+    result = _differenced(routes=(False,))
     assert result["ok"] is False
     assert result["blocker"] == "ARMS_NOT_SERVED_ALIKE"
     assert result["loaded"] == "unproven"
-    assert result["measured_under"]["arms_served_alike"] is False
+    assert result["measured_under"]["arms_on_own_route"] is False
     # And it must say what would address it, because repeating the run will not.
-    assert "More pairs cannot fix this" in result["reason"]
+    assert "more pairs cannot fix this" in result["reason"]
     # The observations are kept: they are what the refusal rests on.
     assert result["differences"] and result["pairs"]
 
 
-def test_a_mixed_route_is_refused_at_any_magnitude():
+def test_arms_agreeing_on_a_foreign_route_is_not_agreement():
+    """The defect this check had while it was being written.
+
+    Reading the condition as "both arms came back the same way" accepts a pair in which
+    *every* arm was answered off-route, because two unidentified replies trivially agree on
+    being unidentified. Nothing in the record says they came from the same place, so what
+    is required is provenance — every arm on the route the harness issued — and not mutual
+    agreement.
+    """
+    under = cp._measured_under([
+        {"cli_version": "0.150.0", "model": "m-a", "reply_carries_own_turn_id": False},
+        {"cli_version": "0.150.0", "model": "m-a", "reply_carries_own_turn_id": False},
+    ])
+    assert under["arms_on_own_route"] is False
+
+
+def test_an_unidentified_route_is_refused_at_any_magnitude():
     """Checked before the noise band on purpose.
 
-    A mixed route invalidates the difference at any magnitude: a large one is not evidence
-    that the file was loaded, and a small one is not evidence that it was not. A big route
-    gap must not be published as `loaded: proven` with a cost attached — and a small one
-    must not be filed under the noise band, which would name drift as the reason when the
-    arms were not comparable in the first place.
+    The route invalidates the difference at any magnitude: a large one is not evidence that
+    the file was loaded, and a small one is not evidence that it was not. A big gap must not
+    be published as `loaded: proven` with a cost attached — and a small one must not be
+    filed under the noise band, which would name drift as the reason when the arms were not
+    comparable in the first place.
     """
-    big = _differenced(routes=(True, False), tokens=(1_000, 40_000))
+    big = _differenced(routes=(False,), tokens=(1_000, 40_000))
     assert big["ok"] is False and big["blocker"] == "ARMS_NOT_SERVED_ALIKE"
     assert "loaded_evidence" not in big
 
     # Inside the noise band, which is what pins the order of the two checks.
-    small = _differenced(routes=(True, False),
+    small = _differenced(routes=(False,),
                          tokens=(1_000, 1_000 + cp.MIN_DETECTABLE_TOKENS - 1))
     assert small["ok"] is False and small["blocker"] == "ARMS_NOT_SERVED_ALIKE"
     assert "inconclusive" not in small
@@ -588,14 +620,58 @@ def test_a_build_that_does_not_report_the_route_still_measures():
     result = _differenced(routes=(None, None))
     assert result["ok"] is True
     assert result["loaded"] == "proven"
-    assert result["measured_under"]["arms_served_alike"] is None
+    assert result["measured_under"]["arms_on_own_route"] is None
 
 
 def test_one_route_throughout_is_what_a_clean_measurement_looks_like():
     """The positive case, so the refusal above is not vacuous."""
     result = _differenced(routes=(True, True))
     assert result["ok"] is True
-    assert result["measured_under"]["arms_served_alike"] is True
+    assert result["measured_under"]["arms_on_own_route"] is True
+
+
+def test_an_arm_on_another_route_is_retried_onto_the_harness_own_route():
+    """The route is a precondition, so it is retried rather than differenced.
+
+    Without this the measurement is simply unavailable whenever anything in front of the
+    provider answers some requests itself. Retrying is the same shape as the flake retry:
+    what is retried is a condition of the request, decided before any token figure is read,
+    so this is not a filter on the outcome.
+    """
+    calls = []
+    # Each arm is answered off-route once, then on-route.
+    result = _differenced(calls, routes=(False, True))
+    assert result["ok"] is True, result.get("reason")
+    assert result["measured_under"]["arms_on_own_route"] is True
+    assert result["differences"] == [400, 400]
+    # Two arms per pair, two calls each, two pairs.
+    assert len(calls) == 8, calls
+    # Backed off between attempts: an immediate retry on a condition that clears by itself
+    # is a way of hammering, and the delay is the same one the flake retry was fitted to.
+    assert result["_slept"] == [cp.ARM_RETRY_DELAY] * 4, result["_slept"]
+
+
+def test_a_route_that_never_settles_is_refused_with_bounded_retries():
+    """The refusal has to survive the retries, and the retries have to stop.
+
+    An unbounded retry on a persistent condition is the failure mode this project already
+    hit once: a budget sized for independent flakes spends until it hits a wall when every
+    attempt fails for the same reason.
+    """
+    calls = []
+    result = _differenced(calls, routes=(False,))
+    assert result["ok"] is False
+    assert result["blocker"] == "ARMS_NOT_SERVED_ALIKE"
+    assert f"retried up to {cp.ARM_RETRIES}" in result["reason"]
+    assert len(calls) == 2 * (cp.ARM_RETRIES + 1) * 2, calls
+
+
+def test_a_build_that_reports_no_route_is_not_retried():
+    """Silence is not a mismatch, so it must not cost a retry either."""
+    calls = []
+    result = _differenced(calls, routes=(None,))
+    assert result["ok"] is True
+    assert len(calls) == 4, calls
 
 
 def main() -> int:
