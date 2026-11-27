@@ -1310,6 +1310,14 @@ def test_an_unstable_verdict_says_so_rather_than_reading_as_settled():
     # cannot produce. The spread is named so the reader can judge how much it matters.
     assert "0.31" in text and "比证据本身的影响更大" in text
     assert "结论就变" not in text
+    # The front-page finding is a separate rendering of the same verdict.
+    for lang in ("en", "zh"):
+        with _lang(lang):
+            findings = rp._findings({"verdicts": verdicts, "components": [], "sessions": 1})
+        detail = next(f["detail"] for f in findings if f["action"] == "keep")
+        assert "flips" not in detail and "结论就变" not in detail
+        assert ("score" in detail and "remains keep" in detail) if lang == "en" else \
+            ("得分" in detail and "仍然是保留" in detail)
 
 
 def test_the_next_steps_preamble_tracks_what_has_actually_been_proven():

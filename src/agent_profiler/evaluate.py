@@ -46,7 +46,7 @@ import time
 from datetime import datetime, timezone
 from pathlib import Path
 
-from .core import is_excluded as _is_excluded_entity
+from .core import SCHEMA_PROBE_SOURCES, is_excluded as _is_excluded_entity
 from .traces import SELF_PROBE_PROMPT, collect_root
 
 
@@ -135,12 +135,11 @@ def _probe(config_path: Path | None, timeout: int) -> dict:
                               stdin=subprocess.DEVNULL)
     except subprocess.TimeoutExpired:
         return {"ok": False, "error": "timeout"}
-    if done.returncode != 0:
-        return {"ok": False, "error": f"exit {done.returncode}: {done.stderr.strip()[:160]}"}
-    try:
-        envelope = json.loads(done.stdout)
-    except json.JSONDecodeError:
-        return {"ok": False, "error": "non-JSON envelope"}
+    from .claude_result import read_result
+
+    envelope, failure = read_result(done)
+    if failure:
+        return failure
 
     usage = envelope.get("usage") or {}
     total = (
@@ -486,7 +485,7 @@ def evaluate_root(
     # Claude Code is the harness whose schema can be probed from here.
     servers: dict[str, dict] = {}
     for declaration in scan.get("mcp_servers") or []:
-        if declaration.get("source") in {"project_root", "user_claude_json", "project_claude_dir"}:
+        if declaration.get("source") in SCHEMA_PROBE_SOURCES:
             servers.setdefault(declaration["name"], declaration)
 
     # No transcript means nothing was observed, which is a different fact from a server

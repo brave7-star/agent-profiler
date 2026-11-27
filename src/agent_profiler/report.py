@@ -1782,9 +1782,9 @@ def _findings(data: dict) -> list[dict]:
                    "not \"looks useful\".",
                 zh="不给这些文件，agent 就不按你写的规范做；给了就按。"
                    "这是实测的行为差异，不是「看起来有用」。")
-                + (tr(en=f" Note that {', '.join(unstable)} flips under a different set of "
-                         "weights.",
-                      zh=f"注意 {'、'.join(unstable)} 换一组权重结论就变。")
+                + (tr(en=f" The score for {', '.join(unstable)} varies with the weights; "
+                         "the recommendation remains keep.",
+                      zh=f"注意 {'、'.join(unstable)} 的得分随权重变化；建议仍然是保留。")
                    if unstable else ""),
             "evidence": [tr(en=f"`{v['name']}`: {v['cost_value']:,} tokens/request — "
                                f"{v['basis']}",

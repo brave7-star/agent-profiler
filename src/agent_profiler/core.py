@@ -740,6 +740,10 @@ def _dedupe(items: list[dict]) -> list[dict]:
 
 
 EXCLUSIONS_FILENAME = "agent-profiler-exclude.json"
+
+# The schema probe can reconstruct these declarations. Inventory also includes nested
+# bundles and downloaded configurations, which are not runnable probe targets.
+SCHEMA_PROBE_SOURCES = frozenset({"project_root", "user_claude_json", "project_claude_dir"})
 # `instruction` joined this list when instruction files stopped being read-only subjects:
 # the `useful` probe sends a verbatim copy of a CLAUDE.md or AGENTS.md to the API, so a user
 # who wants a particular instruction file left alone needs a way to say so.

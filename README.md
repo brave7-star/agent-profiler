@@ -344,7 +344,7 @@ while the bytecode ran another.
 for f in tests/test_*.py; do PYTHONPATH=src python3 -B "$f"; done
 ```
 
-498 regression tests, each pinned to a defect or a format property observed in a real run
+501 regression tests, each pinned to a defect or a format property observed in a real run
 rather than to a hypothetical. No test spends a token.
 
 ## Format notes

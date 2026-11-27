@@ -67,8 +67,14 @@ def _is_measurement(row: object) -> bool:
     status = row.get("status")
     if isinstance(status, str) and status != "measured":
         return False
-    # A probe that failed is reported, never stored as a result: the artifact says `ok:
-    # false`, and keeping it would let a failure read downstream as a reading.
+    # A completed compliance experiment can report ok=False because no effect separated
+    # the arms. That is a measured outcome, unlike a probe that never answered.
+    if (row.get("useful") == "unproven" and row.get("blocker") == "NO_SEPARATION"
+            and (row.get("negative_control") or {}).get("held") is True
+            and not row.get("abandoned")
+            and (row.get("probes_attempted") or 0) > (row.get("probes_failed") or 0)):
+        return True
+    # A probe that failed is reported, never stored as a reading.
     return row.get("ok") is not False
 
 

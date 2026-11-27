@@ -289,13 +289,16 @@ def build_chain(*, scan: dict, traces: dict, evaluation: dict | None = None,
     # call is named `mcp__<server>__<tool>`.
     # A server declared in several places is one component available to several harnesses;
     # collapsing it to whichever declaration was seen first would misattribute it.
+    from .core import SCHEMA_PROBE_SOURCES
+
     declared: dict[str, dict] = {}
     for declaration in scan.get("mcp_servers") or []:
         name = declaration["name"]
         harness = "codex" if "codex" in (declaration.get("source") or "") else "claude_code"
         entry = declared.setdefault(name, {"harnesses": set(), "sources": [],
                                            "scope": declaration.get("scope"),
-                                           "excluded": False})
+                                           "excluded": False, "schema_probe_candidate": False})
+        entry["schema_probe_candidate"] |= declaration.get("source") in SCHEMA_PROBE_SOURCES
         entry["harnesses"].add(harness)
         entry["sources"].append(declaration.get("declared_in", ""))
         # One declaration being excluded excludes the server: the flag is about whether
@@ -379,6 +382,7 @@ def build_chain(*, scan: dict, traces: dict, evaluation: dict | None = None,
             "harness": "+".join(sorted(harnesses)),
             "harnesses": sorted(harnesses),
             "excluded_by_request": entry["excluded"],
+            "schema_probe_candidate": entry["schema_probe_candidate"],
             "scope": entry["scope"],
             "links": {
                 "installed": _link(PROVEN, evidence="; ".join(entry["sources"]),
@@ -806,6 +810,18 @@ def _withheld_because(useful_link: dict, cost_link: dict) -> str:
     return "withheld: requires " + " and ".join(missing)
 
 
+def _unstable_prefix(measurement: dict | None) -> str | None:
+    if not measurement:
+        return None
+    if measurement.get("reproducible") is False:
+        return ("the measured prefix differences did not reproduce "
+                f"(spread {measurement.get('pair_spread_tokens')} tokens); "
+                "their mean is not a reliable per-request cost")
+    if (measurement.get("measured_under") or {}).get("mixed"):
+        return "the probe arms ran under different builds or models; their prefixes are not comparable"
+    return None
+
+
 def _instruction_components(scan: dict, traces: dict, evaluation: dict | None,
                             useful: dict | None = None) -> list[dict]:
     observed = traces.get("observed") or {}
@@ -840,6 +856,7 @@ def _instruction_components(scan: dict, traces: dict, evaluation: dict | None,
         # components, each measured in its own harness, and the Codex figure used to
         # be overwritten by the Claude one.
         measurement = measured.get((_key(path), harness))
+        unstable = _unstable_prefix(measurement)
 
         if record:
             loaded = _link(PROVEN,
@@ -847,6 +864,8 @@ def _instruction_components(scan: dict, traces: dict, evaluation: dict | None,
                                     f"in {record['loads']} of {sessions} sessions "
                                     f"({record['chars']} chars)",
                            strength="observed", value=record["loads"])
+        elif unstable:
+            loaded = _unproven(unstable, "unstable_measurement")
         elif measurement and measurement.get("loaded") == "proven":
             # No record exists for Codex instructions; a measured prefix difference is the
             # evidence instead, which is why this link is provable at all.
@@ -863,11 +882,15 @@ def _instruction_components(scan: dict, traces: dict, evaluation: dict | None,
                                NOT_MEASURED)
 
         conflict = conflict_by_path.get((_key(path), harness))
-        if measurement and measurement.get("ok"):
+        if unstable:
+            cost = _unproven(unstable, "unstable_measurement")
+        elif measurement and measurement.get("ok"):
             evidence = (f"{measurement['mean_tokens']} tokens added to every "
                         f"request, measured over {len(measurement['differences'])} "
                         f"interleaved pair(s) with spread "
                         f"{measurement['pair_spread_tokens']}")
+            if len(measurement["differences"]) == 1:
+                evidence += "; only one pair completed, so reproducibility is unestablished"
             if conflict:
                 # The spread describes agreement inside one window. Printing it next to a
                 # figure another artifact contradicts would read as settled precision.
@@ -993,7 +1016,7 @@ def _entity_useful(kind: str, path: str | None, useful_skills: dict[str, dict]) 
     if measurement.get("useful") != "proven":
         return _unproven(measurement.get("reason")
                          or "a compliance probe ran and did not separate the arms",
-                         NOT_MEASURED)
+                         measurement.get("blocker") or NOT_MEASURED)
     rules = list(measurement.get("rules_proven") or [])
     link = _link(PROVEN, evidence=measurement.get("useful_evidence") or "", value=len(rules),
                  strength="observed", unit="rules_proven")
@@ -1019,6 +1042,9 @@ def _entity_cost(kind: str, path: str | None, measured_skills: dict[str, dict]) 
     made of.
     """
     measurement = measured_skills.get(_resolved_dir(path)) if path else None
+    unstable = _unstable_prefix(measurement)
+    if unstable:
+        return _unproven(unstable, "unstable_measurement")
     if measurement:
         caveats = "through the plugin channel, against the measurement's own baseline"
         if measurement.get("measured_on"):
@@ -1626,6 +1652,22 @@ def _candidate(component: dict, link: str) -> dict:
                 "note": "you asked this tool not to contact this component, and every "
                 "method for this link requires contacting it"}
 
+    if link == "useful" and blocker == "NO_SEPARATION":
+        return {"link": link, "achievable": False,
+                "method": "completed compliance probe; no separation",
+                "estimated_usd": None,
+                "note": "the completed experiment detected no behavioural separation on "
+                "its tasks; repeating the same probe is not a missing measurement. "
+                "This does not establish that the component has no effect on other tasks"}
+
+    if blocker == "unstable_measurement":
+        return {"link": link, "achievable": False,
+                "method": "diagnose inconsistent prefix measurements before repeating",
+                "estimated_usd": None,
+                "note": "a prefix experiment already ran but its readings were not "
+                "comparable or reproducible; investigate the measurement conditions "
+                "before paying for the same probe again"}
+
     # A skill that states its own checkable rule is in the same position as an instruction
     # file, and the arm that adds exactly one skill back is verified. Both arms drop the
     # user's own instruction files, so a rule those happen to state as well cannot account
@@ -1729,6 +1771,12 @@ def _candidate(component: dict, link: str) -> dict:
                     "estimated_usd": None,
                     "note": f"`evaluate` probes Claude Code only, so a {'/'.join(harnesses)} "
                     "server's schema cost cannot be measured by this tool today"}
+        if component.get("schema_probe_candidate") is False:
+            return {"link": link, "achievable": False,
+                    "method": "declaration outside the schema probe's supported sources",
+                    "estimated_usd": None,
+                    "note": "this configuration was inventoried, but `evaluate` cannot "
+                    "select its declaration; running it would not measure this server"}
         return {"link": link, "achievable": True, "method": "stage 6 paired probe",
                 "estimated_usd": 0.30, "note": "already implemented; run `evaluate --measure`"}
 

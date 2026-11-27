@@ -531,6 +531,25 @@ def test_no_measurement_is_proposed_for_an_excluded_component():
     assert "not to contact" in cost["note"]
 
 
+def test_nested_mcp_inventory_is_not_offered_as_a_runnable_schema_probe():
+    from agent_profiler.evaluate import evaluate_root
+
+    with _env(_trace_calling([]), {"direct": {"command": "fixture"}}) as root:
+        nested = root / "bundle"
+        nested.mkdir()
+        (nested / ".mcp.json").write_text(json.dumps({"mcpServers": {
+            "nested-only": {"command": "fixture"}, "direct": {"command": "fixture"}
+        }}))
+        data = score_root(str(root))
+        components = {c["name"]: c for c in data["components"] if c["kind"] == "mcp"}
+        offered = {name for name, c in components.items()
+                   if sc._candidate(c, "cost")["achievable"]}
+        runnable = {e["server"] for e in evaluate_root(str(root))["evaluations"]}
+    assert "nested-only" in components, "unsupported declarations must remain visible"
+    assert offered == runnable == {"direct"}
+    assert sc._candidate(components["nested-only"], "cost")["estimated_usd"] is None
+
+
 def test_a_claude_instruction_cost_is_offered_because_the_route_now_works():
     """It was recorded unsolved on a half-true premise: removal from a copied config does
     hide the auth token, but *additive injection* was abandoned after an unpaired run
@@ -1157,6 +1176,33 @@ def test_a_codex_measurement_proves_loading_that_no_record_reports():
     # is observed, the projection over a corpus is not.
     cost = entry["links"]["cost"]
     assert cost["status"] == sc.PARTIAL and cost["value"] == 450
+
+
+def test_unstable_prefixes_never_supply_loading_proof_or_a_cost_floor():
+    with tempfile.TemporaryDirectory() as raw:
+        path = Path(raw) / "AGENTS.md"
+        path.write_text("project rules\n")
+        measurement = {"file": str(path), "harness": "codex", "ok": True,
+                       "loaded": "proven", "loaded_evidence": "fixture difference",
+                       "mean_tokens": 700, "differences": [400, 1000],
+                       "pair_spread_tokens": 600}
+        for refusal in ({"reproducible": False},
+                        {"measured_under": {"mixed": {"models": ["a", "b"]}}}):
+            reading = {**measurement, **refusal}
+            scan = _instruction_scan(path)
+            scan["files"][0]["kind"] = "agents_md"
+            components = sc._instruction_components(
+                scan, {}, {"instruction_measurements": [reading]})
+            assert len(components) == 1
+            for link in ("loaded", "cost"):
+                assert components[0]["links"][link]["status"] == sc.UNPROVEN
+                assert components[0]["links"][link]["blocker"] == "unstable_measurement"
+                assert components[0]["links"][link]["value"] is None
+            candidate = sc._candidate(components[0], "cost")
+            assert candidate["achievable"] is False and candidate["estimated_usd"] is None
+            assert "diagnose" in candidate["method"]
+            skill_cost = sc._entity_cost("skills", str(path), {sc._resolved_dir(str(path)): reading})
+            assert skill_cost["status"] == sc.UNPROVEN and skill_cost["value"] is None
 
 
 def test_instruction_components_with_the_same_basename_are_distinguishable():

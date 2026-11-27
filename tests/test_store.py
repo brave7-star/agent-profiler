@@ -168,6 +168,38 @@ def test_a_failed_probe_is_not_stored_as_a_reading():
             stage="measure-instructions") is None
 
 
+def test_a_completed_null_result_survives_storage_and_does_not_offer_the_same_probe():
+    from agent_profiler import score as sc
+
+    with _store() as directory:
+        path = directory / "AGENTS.md"
+        path.write_text("- 标题末尾带议题编号。\n", encoding="utf-8")
+        reading = {"ok": False, "file": str(path), "useful": "unproven",
+                   "blocker": "NO_SEPARATION", "reason": "no difference on the tested tasks",
+                   "negative_control": {"held": True}, "probes_attempted": 12,
+                   "probes_failed": 0}
+        kept = st.remember({"useful_measurements": [reading]}, stage="measure-useful")
+        assert kept is not None
+        restored = st.stored(keys=st.USEFUL_KEYS)
+        assert restored["useful_measurements"] == [reading]
+        scan = {"files": [{"kind": "agents_md", "origin": "declared",
+                           "scope": "user", "path": str(path)}]}
+        component = sc._instruction_components(scan, {}, None, restored)[0]
+        assert component["links"]["useful"]["blocker"] == "NO_SEPARATION"
+        assert component["links"]["useful"]["status"] == sc.UNPROVEN
+        assert sc._candidate(component, "useful")["achievable"] is False
+        component["links"]["useful"]["blocker"] = sc.NOT_MEASURED
+        assert sc._candidate(component, "useful")["achievable"] is True, \
+            "before the experiment this fixture must offer a real probe"
+        skill_link = sc._entity_useful("skills", str(path), {sc._resolved_dir(str(path)): reading})
+        assert skill_link["blocker"] == "NO_SEPARATION"
+        assert skill_link["status"] == sc.UNPROVEN
+        for invalid in ({"negative_control": {"held": False}},
+                        {"abandoned": "fixture outage"}, {"probes_failed": 12}):
+            assert st.remember({"useful_measurements": [{**reading, **invalid}]},
+                               stage="measure-useful") is None
+
+
 def test_the_store_follows_a_redirected_environment():
     """A measurement describes one environment, so it must not be filed under another's.
 

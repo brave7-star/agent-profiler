@@ -293,7 +293,7 @@ PYTHONPATH=src python3 -B -m agent_profiler.cli verify     # 和那个壳等价
 for f in tests/test_*.py; do PYTHONPATH=src python3 -B "$f"; done
 ```
 
-498 个回归测试，每一个都钉在一个真实运行里观察到的缺陷或格式性质上，而不是钉在某个假想情况上。
+501 个回归测试，每一个都钉在一个真实运行里观察到的缺陷或格式性质上，而不是钉在某个假想情况上。
 没有任何测试花掉一个 token。
 
 ## 格式笔记
