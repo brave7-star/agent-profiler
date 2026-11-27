@@ -224,14 +224,39 @@ Probe reliability is **bounded, not explained**: the failure rate is measured, a
 retry budget is derived from it, and failed spend is costed. The cause is unknown, and that
 verdict is recorded as needing a different approach rather than as a solved problem.
 
-### Feeding measurements back in
+### Measurements are kept for you
+
+Measurement is the only thing here that costs money, and it is the only thing that cannot be
+re-derived for free. So a `measure-*` or `evaluate --measure` run writes its result to
+`~/.local/state/agent-profiler/measurements/` as well as to stdout, and `report` and `score`
+read that directory automatically:
+
+```bash
+./bin/agent-profiler measure-instructions --root PATH --all   # costs money, once
+./bin/agent-profiler report --root PATH --all                 # free, and has the cost column
+```
+
+Before this, a measurement went to stdout only. Feeding it back meant remembering
+`--output`, remembering where the file went, and passing `--evaluation` on every later run —
+and a report without that flag showed **no cost column at all**: the most expensive output in
+the project, invisible by default. Producing a report with costs meant hand-merging several
+artifacts into one file.
+
+The store is append-only, one plain-JSON file per run, and `AGENT_PROFILER_STORE` overrides
+the location. Two measurements of one file are both kept: readings that disagree are a
+finding this tool reports, not a conflict to settle by recency. A report built from stored
+figures says so on its first screen, so a remembered number is never mistaken for one
+measured just now.
+
+### Overriding what it uses
 
 ```bash
 ./bin/agent-profiler report --root PATH --all --evaluation EVAL.json --useful USEFUL.json
 ```
 
-Pass both when both exist: supplying one alone once dropped the other's measurements
-silently.
+`--evaluation` wins over the store, which is what a reader comparing a fresh measurement
+against the kept one needs. Pass both flags when both artifacts exist: supplying one alone
+once dropped the other's measurements silently.
 
 A measurement joins to a component by absolute path or server name, so an artifact produced
 on another machine parses but joins to nothing — and the links it should have proven then
@@ -310,7 +335,7 @@ while the bytecode ran another.
 for f in tests/test_*.py; do PYTHONPATH=src python3 -B "$f"; done
 ```
 
-472 regression tests, each pinned to a defect or a format property observed in a real run
+483 regression tests, each pinned to a defect or a format property observed in a real run
 rather than to a hypothetical. No test spends a token.
 
 ## Format notes

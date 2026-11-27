@@ -1843,10 +1843,16 @@ def score_root(root: str, *, profile: str | None = None, evaluation_path: str | 
     scan = inspect_stack(str(base), whole_environment=whole_environment, exclusions=exclusions)
     traces = collect_root(str(base), limit, whole_environment=whole_environment,
                           use_cache=use_cache)
+    # Same rule as `report`: an explicit artifact wins, otherwise earlier measurements are
+    # read from the store so paid work is not lost to a forgotten path.
     evaluation = None
     if evaluation_path:
         import json
         evaluation = json.loads(Path(evaluation_path).read_text(encoding="utf-8"))
+    else:
+        from .store import stored
+
+        evaluation = stored()
     useful = None
     if useful_path:
         import json

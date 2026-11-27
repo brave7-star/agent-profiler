@@ -27,6 +27,23 @@ def dump(data, output):
         print(s)
 
 
+def _keep(data, stage):
+    """Keep a paid measurement where later runs will find it, and say where it went.
+
+    Measurement is the one thing here that costs money, and it used to go to stdout only:
+    feeding it back meant remembering a path, and a `report` run without that path showed no
+    cost column at all. The note goes to stderr so piping the JSON stays unaffected.
+    """
+    from .store import remember
+
+    path = remember(data, stage=stage)
+    if path:
+        print(f"kept this measurement at {path}\n"
+              f"  `report` and `score` read it automatically from now on; "
+              f"pass --evaluation to use a different artifact instead.", file=sys.stderr)
+    return path
+
+
 def _whole_env(parser):
     """Shared flags for asking about the environment rather than one project."""
     parser.add_argument("--all", dest="whole_environment", action="store_true",
@@ -248,6 +265,7 @@ def main(argv=None):
             data = evaluate_root(a.root, measure=a.measure, harness=a.harness,
                                  timeout=a.timeout, exclusions=_exclusions_for(a, a.root),
                                  whole_environment=a.whole_environment)
+            _keep(data, "evaluate")
         elif a.cmd == "measure-useful":
             data = measure_useful(a.root, repeats=a.repeats, timeout=a.timeout,
                                   whole_environment=a.whole_environment,
@@ -255,9 +273,11 @@ def main(argv=None):
         elif a.cmd == "measure-skills":
             data = measure_skills(a.root, pairs=a.pairs, timeout=a.timeout,
                                   whole_environment=a.whole_environment, only=a.only)
+            _keep(data, "measure-skills")
         elif a.cmd == "measure-instructions":
             data = measure_instructions(a.root, pairs=a.pairs, timeout=a.timeout,
                                         whole_environment=a.whole_environment)
+            _keep(data, "measure-instructions")
         elif a.cmd == "verify":
             data = verify(limit=a.limit)
             if a.format == "text":

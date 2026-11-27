@@ -294,9 +294,16 @@ def _collect(root: str, limit: int | None, evaluation_path: str | None,
     shared, codex_usage = codex_rollups(codex_skill_paths(scan),
                                         None if whole_environment else Path(root),
                                         use_cache=use_cache)
+    # An explicit artifact wins; otherwise the measurements kept from earlier runs are used.
+    # Without this the cost column was empty unless the reader remembered a path, which made
+    # the most expensive output in the project the one least likely to be seen.
     evaluation = None
     if evaluation_path:
         evaluation = json.loads(Path(evaluation_path).read_text(encoding="utf-8"))
+    else:
+        from .store import stored
+
+        evaluation = stored()
     useful = None
     if useful_path:
         useful = json.loads(Path(useful_path).read_text(encoding="utf-8"))
@@ -1036,6 +1043,19 @@ def _render(data: dict) -> str:
            zh=f"生成时间：{data['generated_at']}　|　只读，没有改动任何真实配置"),
         "",
     ]
+
+    # Where the cost figures came from. A report that silently used measurements taken weeks
+    # ago reads as though it measured something this run, and the reader has no way to tell
+    # a fresh figure from a remembered one.
+    source = data.get("measurement_source") or {}
+    if source.get("from_store"):
+        lines += [tr(
+            en=f"Cost figures come from {count(len(source.get('sources') or []), 'measurement')}"
+               f" kept from earlier runs (`{source.get('store')}`), not from anything measured "
+               f"just now. Nothing here spent a token.",
+            zh=f"成本数字来自以前测过、留存下来的 "
+               f"{len(source.get('sources') or [])} 份测量（`{source.get('store')}`），"
+               f"不是这次新测的。本次运行没有花任何 token。"), ""]
 
     # Before anything else, because an orphaned measurement makes the links below read
     # weaker than the evidence the reader actually paid for.
@@ -2161,6 +2181,13 @@ def report_root(root: str, *, evaluation_path: str | None = None,
         # nobody ran, so it is surfaced rather than silently weakening a link.
         "unmatched_measurements": orphans,
         "relocation_candidates": traces["observed"].get("relocation_candidates") or [],
+        # Whether the cost figures were supplied, remembered, or absent. Without this a
+        # reader cannot tell a figure measured this run from one kept weeks ago.
+        "measurement_source": {
+            "from_store": bool((evaluation or {}).get("from_store")),
+            "store": (evaluation or {}).get("store"),
+            "sources": (evaluation or {}).get("sources") or [],
+        } if evaluation else {"from_store": False, "sources": []},
         "observed": {
             "installed": {
                 "files": scan_observed["files_found"],
