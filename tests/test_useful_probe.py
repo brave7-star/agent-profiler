@@ -222,6 +222,28 @@ def test_probes_close_stdin():
         "depend on the caller's unconsumed input")
 
 
+def test_instruction_and_skill_probes_cannot_inherit_mcp_servers():
+    from unittest.mock import patch
+    from types import SimpleNamespace
+
+    calls = []
+
+    def launch(argv, **kwargs):
+        calls.append(argv)
+        # Fail before parsing an envelope; only the actual process boundary matters.
+        return SimpleNamespace(returncode=1, stderr="fixture stop")
+
+    with _tmp() as tmp, patch.object(up.subprocess, "run", side_effect=launch):
+        up._probe("fixture", tmp, None, 1)
+        up._probe("fixture", tmp, None, 1, bare=False,
+                  extra_args=("--setting-sources", "", "--plugin-dir", str(tmp)))
+    assert len(calls) == 2
+    for argv in calls:
+        assert "--strict-mcp-config" in argv
+        assert json.loads(argv[argv.index("--mcp-config") + 1]) == {"mcpServers": {}}
+    assert "--bare" not in calls[1] and "--plugin-dir" in calls[1]
+
+
 def test_no_result_overstates_what_was_measured():
     """External validity is weak and the payload must not let a reader forget it."""
     with _probe_returning(), _tmp() as tmp:

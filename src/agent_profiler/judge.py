@@ -272,13 +272,11 @@ def _invoke(prompt: str, timeout: int) -> dict:
         )
     except subprocess.TimeoutExpired:
         return {"ok": False, "error": "timeout", "elapsed_ms": round((time.perf_counter() - started) * 1000, 1)}
-    if done.returncode != 0:
-        return {"ok": False, "error": f"exit {done.returncode}: {done.stderr.strip()[:200]}"}
+    from .claude_result import read_result
 
-    try:
-        envelope = json.loads(done.stdout)
-    except json.JSONDecodeError:
-        return {"ok": False, "error": "judge returned non-JSON envelope"}
+    envelope, failure = read_result(done)
+    if failure:
+        return failure
 
     usage = envelope.get("usage") or {}
     text = envelope.get("result") or ""

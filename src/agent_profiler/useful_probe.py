@@ -285,7 +285,10 @@ def _probe(prompt: str, workdir: Path, instruction: Path | None, timeout: int,
     skips plugin sync, so `--plugin-dir` silently loads nothing under it. That was found by
     nonce discrimination, not assumed — see `codex_probe.measure_skill_cost`.
     """
-    argv = ["claude", "-p", prompt, "--output-format", "json"]
+    # Skill arms cannot use bare mode. Clearing setting sources does not isolate the
+    # MCP registry, so explicitly load an empty server set in every non-MCP probe.
+    argv = ["claude", "-p", prompt, "--output-format", "json",
+            "--strict-mcp-config", "--mcp-config", '{"mcpServers":{}}']
     if bare:
         argv.append("--bare")
     argv += list(extra_args)
@@ -300,19 +303,11 @@ def _probe(prompt: str, workdir: Path, instruction: Path | None, timeout: int,
                               stdin=subprocess.DEVNULL)
     except subprocess.TimeoutExpired:
         return {"ok": False, "error": "timeout", "cost_usd": 0.0}
-    if done.returncode != 0:
-        # The harness's own complaint, not just the exit code. 72 of 90 probes in one real
-        # run reported nothing but `exit 1`, which was indistinguishable from the known
-        # auth/init flake and left no way to tell a transient failure from a wrong argument
-        # — the run had to be diagnosed by reproducing it by hand afterwards.
-        detail = " ".join((done.stderr or "").split())[:300]
-        return {"ok": False, "cost_usd": 0.0,
-                "error": f"exit {done.returncode}" + (f": {detail}" if detail else
-                                                      " (no stderr)")}
-    try:
-        envelope = json.loads(done.stdout)
-    except json.JSONDecodeError:
-        return {"ok": False, "error": "non-JSON envelope", "cost_usd": 0.0}
+    from .claude_result import read_result
+
+    envelope, failure = read_result(done)
+    if failure:
+        return failure
     usage = envelope.get("usage") or {}
     ctx = sum(int(usage.get(key) or 0) for key in
               ("input_tokens", "cache_read_input_tokens", "cache_creation_input_tokens"))
