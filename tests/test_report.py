@@ -1371,6 +1371,111 @@ def test_the_carried_rows_are_empty_when_no_rate_was_measured():
     assert rp._render_carried([]) == []
 
 
+def _standing_data(*, spent=1_000_000, carried=None, diverged=(), components=()):
+    """The slice of report data the standing block reads, and nothing else."""
+    return {
+        "observed": {"tokens_spent": spent},
+        "stack_cost": {"claude_code": {"per_request_tokens_floor": 700}},
+        "carried": carried if carried is not None else [
+            {"name": "x", "requests_scope": "user", "tokens_carried": 10_000}],
+        "diverged_duplicates": list(diverged),
+        "components": list(components),
+    }
+
+
+def _component(name, *, cost=None, used=rp.UNPROVEN, loaded=rp.PROVEN):
+    link = {"status": rp.PARTIAL if cost is not None else rp.UNPROVEN, "value": cost}
+    return {"name": name, "kind": "skills", "harness": "claude_code",
+            "coverage": {"scorable": False},
+            "links": {"cost": link, "used": {"status": used}, "loaded": {"status": loaded}}}
+
+
+def test_the_standing_answers_good_or_bad_with_a_self_relative_share():
+    """The question "is my environment any good" is not answered by a token count. A count
+    is an input; the judgement needs a direction, and a share of this environment's own
+    consumption has one without any other machine to compare against."""
+    data = _standing_data(spent=1_000_000, carried=[
+        {"name": "a", "requests_scope": "user", "tokens_carried": 10_000}])
+    share = next(d for d in rp._standing(data)["dimensions"]
+                 if d["key"] == "overhead_share")
+    assert share["value"] == "1.0%"
+    assert share["verdict"] == "good"
+    assert "1,000,000" in share["basis"] and "10,000" in share["basis"]
+
+
+def test_a_heavy_share_is_not_reported_as_fine():
+    """The direction has to actually bite, or the verdict column is decoration."""
+    data = _standing_data(spent=100_000, carried=[
+        {"name": "a", "requests_scope": "user", "tokens_carried": 30_000}])
+    share = next(d for d in rp._standing(data)["dimensions"]
+                 if d["key"] == "overhead_share")
+    assert share["value"] == "30.0%"
+    assert share["verdict"] == "heavy"
+
+
+def test_the_share_counts_a_component_installed_twice_once():
+    """Two copies of one skill carry one prefix. Summing both rows inflated an earlier
+    figure by about 30%, and the same trap applies to a ratio."""
+    data = _standing_data(spent=1_000_000, carried=[
+        {"name": "dup", "requests_scope": "user", "tokens_carried": 10_000},
+        {"name": "dup", "requests_scope": "user", "tokens_carried": 9_000}])
+    share = next(d for d in rp._standing(data)["dimensions"]
+                 if d["key"] == "overhead_share")
+    assert share["value"] == "1.0%"
+
+
+def test_the_share_is_omitted_rather_than_shown_as_zero_when_nothing_was_measured():
+    """A `0.0%` overhead on an unmeasured environment reads as "costs nothing", which is
+    the strongest possible claim resting on no evidence at all."""
+    data = _standing_data(carried=[])
+    keys = [d["key"] for d in rp._standing(data)["dimensions"]]
+    assert "overhead_share" not in keys
+    # The rows that need no measurement are still there, so the block is not simply empty.
+    assert "contradictions" in keys and "paid_for_unused" in keys
+
+
+def test_the_standing_counts_contradictions_and_idle_components():
+    data = _standing_data(
+        diverged=[{"name": "a"}, {"name": "b"}],
+        components=[_component("paid-idle", cost=160),
+                    _component("paid-used", cost=200, used=rp.PROVEN),
+                    _component("free-idle")])
+    dims = {d["key"]: d for d in rp._standing(data)["dimensions"]}
+    assert dims["contradictions"]["value"] == "2"
+    assert dims["contradictions"]["verdict"] == "fix"
+    # Only the one that costs something and was never invoked: a component with no measured
+    # cost is not "paid for nothing", and one that was used is not idle.
+    assert dims["paid_for_unused"]["value"] == "1"
+    assert dims["paid_for_unused"]["components"] == ["paid-idle"]
+
+
+def test_a_clean_environment_reads_as_fine_rather_than_as_missing_data():
+    data = _standing_data(diverged=[], components=[])
+    dims = {d["key"]: d for d in rp._standing(data)["dimensions"]}
+    assert dims["contradictions"]["verdict"] == "good"
+    assert dims["paid_for_unused"]["verdict"] == "good"
+
+
+def test_the_standing_is_never_merged_into_one_score():
+    """A share and two counts have no common unit. Merging them needs a weighting nobody
+    supplied — the same objection that keeps the per-component score withheld."""
+    data = _standing_data(
+        diverged=[{"name": "a"}], components=[_component("p", cost=160)])
+    standing = rp._standing(data)
+    assert "score" not in standing and "total" not in standing
+    text = "\n".join(rp._standing_lines(standing))
+    assert "不合成一个总分" in text or "not** combined" in text
+    # Every row carries its own limits, under the table rather than in a footnote nobody
+    # reaches: a reading with no stated boundary is how a number gets over-read.
+    for d in standing["dimensions"]:
+        assert d["limit"] and d["limit"] in text
+
+
+def test_the_standing_block_is_absent_when_there_is_nothing_to_say():
+    assert rp._standing_lines({}) == []
+    assert rp._standing_lines({"dimensions": []}) == []
+
+
 def main():
     tests = [v for k, v in sorted(globals().items()) if k.startswith("test_") and callable(v)]
     for t in tests:

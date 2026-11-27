@@ -1083,9 +1083,11 @@ def _render(data: dict) -> str:
         ]
 
     lines += [
-        # Findings come first, then the detail that backs them. The other order was the
-        # report's original sin: a reader looking for "is my setup any good" met a coverage
-        # table, and the evidence discipline below was enforced for nobody.
+        # The standing first, then the findings, then the detail that backs them. The
+        # original order was the report's first sin: a reader asking "is my setup any good"
+        # met a coverage table. Leading with a token figure was the second — a count is an
+        # input to that question, not an answer to it.
+        *_standing_lines(data.get("standing") or {}),
         *_overhead_line(data),
         *_finding_lines(data["findings"], data),
         # The verdict next: it is the one place a component gets a conclusion, and on an
@@ -1753,6 +1755,150 @@ def _finding_lines(findings: list[dict], data: dict) -> list[str]:
     return lines
 
 
+def _standing(data: dict) -> dict:
+    """How this environment is doing, in the three terms its own evidence can decide.
+
+    A reader asking "is my stack good or bad" is not asking for a token count. The count is
+    an input; the judgement needs a direction, and this project spent a long time unable to
+    give one because it looked for the answer in a per-component score. That needs every
+    link proven for every component, which real data never supplies, so the score stayed
+    withheld and the question went unanswered.
+
+    These three need no such coverage, and no outside baseline either:
+
+    - **Overhead share** divides the always-on prefix by this environment's own measured
+      consumption. Self-relative, so "is a prefix of this size a lot" becomes answerable
+      without anyone else's stack to compare against.
+    - **Contradictions** counts components installed twice with differing content. An
+      absolute count whose good value is zero.
+    - **Paid for nothing** counts components with a measured cost and no evidence of use.
+      Also absolute, and also zero-is-good.
+
+    Each is returned with its own basis and its own limits, and none is combined into a
+    single number: adding a ratio to two counts would invent a scale nobody can audit.
+    """
+    spent = (data.get("observed") or {}).get("tokens_spent")
+    out: dict = {"dimensions": []}
+
+    floors = {h: v for h, v in (data.get("stack_cost") or {}).items()
+              if v.get("per_request_tokens_floor")}
+    carried = [r for r in (data.get("carried") or []) if r.get("tokens_carried")]
+    if floors and spent and carried:
+        # Summed over components, not floor times requests: the two harnesses have different
+        # request counts, and a component installed twice must be counted once. `carried`
+        # already resolves both, and already excludes projects with no requests.
+        seen: dict = {}
+        for row in carried:
+            key = (row["name"], row.get("requests_scope"))
+            seen[key] = max(seen.get(key, 0), row["tokens_carried"])
+        prefix = sum(seen.values())
+        share = prefix / spent
+        out["dimensions"].append({
+            "key": "overhead_share",
+            "label": tr(en="what the always-on components cost you",
+                        zh="常驻组件占了你多少开销"),
+            "value": f"{share * 100:.1f}%",
+            "direction": "lower_is_better",
+            "verdict": ("good" if share < 0.05 else
+                        "watch" if share < 0.15 else "heavy"),
+            "basis": tr(
+                en=f"{prefix:,} of {spent:,} measured tokens. Both sides are observed: the "
+                   f"numerator is each component's measured rate times the requests that "
+                   f"carried it, the denominator this corpus's own consumption. Nothing "
+                   f"here is compared against another machine",
+                zh=f"{spent:,} 个实测 token 里有 {prefix:,}。两边都是实测：分子是每个组件的"
+                   f"实测速率乘上真正搬过它的请求数，分母是这份语料自己的消耗。"
+                   f"这里没有跟任何别的机器比"),
+            "limit": tr(
+                en="a floor, so the real share is higher: components with no measured rate "
+                   "contribute nothing to the numerator. It also says nothing about whether "
+                   "the tokens were worth spending",
+                zh="这是下限，真实占比只会更高：没测出速率的组件对分子贡献为 0。"
+                   "它也完全不说这些 token 花得值不值"),
+        })
+
+    diverged = data.get("diverged_duplicates") or []
+    out["dimensions"].append({
+        "key": "contradictions",
+        "label": tr(en="components installed twice with different content",
+                    zh="装了两份、内容还不一样的组件"),
+        "value": str(len(diverged)),
+        "direction": "lower_is_better",
+        "verdict": "good" if not diverged else "fix",
+        "basis": tr(
+            en="read off disk: the same name under two roots, with different bytes. The "
+               "harness lists each name once, so one copy is loaded and which one is not "
+               "recorded anywhere",
+            zh="直接从磁盘读出来的：同一个名字在两个 root 下，内容不同。宿主程序对每个名字"
+               "只列一次，所以只有一份被加载，而是哪一份任何地方都没记"),
+        "limit": tr(en="two copies with identical content are not counted: whichever one "
+                       "the harness loads, the instructions are the same",
+                    zh="内容相同的两份不计入：宿主程序无论加载哪一份，规范都是一样的"),
+    })
+
+    idle = [c for c in components_of(data)
+            if (c["links"]["cost"].get("value") is not None
+                and c["links"]["used"]["status"] == UNPROVEN
+                and c["links"]["loaded"]["status"] == PROVEN)]
+    out["dimensions"].append({
+        "key": "paid_for_unused",
+        "label": tr(en="components you pay for on every request and never invoked",
+                    zh="每次请求都在付钱、却从没被显式调用过的组件"),
+        "value": str(len(idle)),
+        "direction": "lower_is_better",
+        "verdict": "good" if not idle else "check",
+        "basis": tr(
+            en="loading is proven from the harness's own records and the cost is measured; "
+               "what is absent is any explicit invocation in this corpus",
+            zh="「载入过」是从宿主程序自己的记录里证明的，成本也是实测的；缺的是这份语料里"
+               "任何一次显式调用"),
+        "limit": tr(
+            en="zero invocations is not evidence of zero effect: a component matched by "
+               "description enters context with no record at all, so this cannot "
+               "distinguish \"never had an effect\" from \"had one without being named\"",
+            zh="0 次调用不等于 0 影响：靠描述匹配进上下文不留任何记录，所以这个数分不清"
+               "「从没起过作用」和「起了作用但没被点名」"),
+        "components": [c["name"] for c in idle],
+    })
+    return out
+
+
+_STANDING_MARKS = {
+    "good": ("✅", lambda: tr(en="fine", zh="没问题")),
+    "watch": ("⚠️", lambda: tr(en="worth watching", zh="值得留意")),
+    "heavy": ("❌", lambda: tr(en="heavy", zh="偏重")),
+    "fix": ("❌", lambda: tr(en="go tidy up", zh="该收拾")),
+    "check": ("⚠️", lambda: tr(en="go check", zh="去查一下")),
+}
+
+
+def _standing_lines(standing: dict) -> list[str]:
+    """The verdict block. It leads the report, before any table.
+
+    Deliberately not a single score. The three dimensions are in different units and the
+    only way to merge them is a weighting nobody supplied, which is the same objection that
+    keeps the per-component score withheld.
+    """
+    dimensions = standing.get("dimensions") or []
+    if not dimensions:
+        return []
+    lines = [tr(en="## How this environment is doing", zh="## 这套环境怎么样"), "",
+             tr(en="| | measure | reading | basis |", zh="| | 看什么 | 结果 | 依据 |"),
+             "| --- | --- | --- | --- |"]
+    for d in dimensions:
+        mark, word = _STANDING_MARKS[d["verdict"]]
+        lines.append(f"| {mark} {word()} | {d['label']} | **{d['value']}** | {d['basis']} |")
+    lines += ["", tr(
+        en="Each row is judged on its own terms and they are **not** combined: a share and "
+           "two counts have no common unit, and merging them would need a weighting nobody "
+           "supplied. Every row's own limits:",
+        zh="每一行都按自己的标准判断，而且**不合成一个总分**：一个占比和两个计数没有共同单位，"
+           "合起来需要一组没人给过的权重。每一行各自的边界："), ""]
+    for d in dimensions:
+        lines.append(f"- **{d['label']}** — {d['limit']}")
+    return lines + [""]
+
+
 def _overhead_line(data: dict) -> list[str]:
     """The one number from the old prose first screen that is not a finding.
 
@@ -2032,6 +2178,10 @@ def report_root(root: str, *, evaluation_path: str | None = None,
             "link_coverage": link_coverage,
             "components_total": len(components),
             "components_scorable": len(scorable),
+            # The denominator the overhead share is taken against. Already in the `cost`
+            # block as a formatted string; kept here as a number so a consumer does not
+            # have to parse prose to divide by it.
+            "tokens_spent": traces["observed"]["tokens"]["total_tokens"],
         },
         "stack_score": stack,
         "sessions": traces["observed"]["sessions_collected"],
@@ -2064,8 +2214,9 @@ def report_root(root: str, *, evaluation_path: str | None = None,
         },
     }
     data["headline"] = _headline(components, link_coverage, stack)
-    # Findings are derived from the rest of `data`, so they are computed after it exists
-    # rather than being threaded through every helper that feeds them.
+    # Both are derived from the rest of `data`, so they are computed after it exists rather
+    # than being threaded through every helper that feeds them.
+    data["standing"] = _standing(data)
     data["findings"] = _findings(data)
     # Rendering is part of what this costs, and on a large stack it was the most expensive
     # part of all — so the figure is stamped after it, not before. A total cannot be printed
