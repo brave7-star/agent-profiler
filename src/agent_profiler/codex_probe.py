@@ -98,6 +98,11 @@ def _measured_under(arms: list[dict]) -> dict:
     A list rather than a single value, because a build that changed mid-measurement would
     make the two arms incomparable — which is exactly the defect this field exists to catch,
     so it must be able to report it rather than silently keep the first value it saw.
+
+    The serving route belongs here for the same reason, and it is the stronger of the two:
+    a build and a model can be read off the config, while the route cannot. Arms answered by
+    different routes carry token figures that were not produced by one accounting, so their
+    difference measures the routes and not the file.
     """
     def distinct(key):
         return sorted({a[key] for a in arms if a.get(key)})
@@ -109,6 +114,13 @@ def _measured_under(arms: list[dict]) -> dict:
         out["mixed"] = {"cli_versions": versions, "models": models}
         out["warning"] = ("the arms did not all run under one build or model, so their "
                           "difference is not a clean measurement of the file")
+    # Membership is read, not truthiness: `False` is an observation and would be filtered
+    # out by `distinct`, which is the whole signal this is looking for.
+    routes = {a["reply_carries_own_turn_id"] for a in arms
+              if a.get("reply_carries_own_turn_id") is not None}
+    # `None` means the build did not stamp turns in a way this can read, which is not the
+    # same as having checked and found one route.
+    out["arms_served_alike"] = None if not routes else len(routes) == 1
     return out
 
 
@@ -126,6 +138,15 @@ def _rollout_run(home: Path, since: float) -> dict:
     thing available. A missing value stays `None` rather than being guessed at: the rollout
     is the harness's own record, and inventing a build number would be worse than admitting
     the run did not say.
+
+    The reply's own turn id is read for the same reason, one level further out. A CLI can be
+    pointed at a relay rather than at the model provider, and a relay is free to answer two
+    identical requests by two different routes. When it does, the usage figures stop being
+    comparable — and the difference between two arms is *only* a measurement if both arms
+    were served the same way. The signal is cheap and local: the harness stamps each turn
+    with an id and the reply carries that id back, so a reply bearing an id the harness never
+    generated was assembled by something in the middle. That is not a judgement about the
+    relay; it is the reason two readings of one file need not agree.
     """
     newest, newest_mtime = None, since
     for path in home.rglob("rollout-*.jsonl"):
@@ -136,8 +157,11 @@ def _rollout_run(home: Path, since: float) -> dict:
         if mtime >= newest_mtime:
             newest, newest_mtime = path, mtime
     if newest is None:
-        return {"input_tokens": None, "cli_version": None, "model": None}
+        return {"input_tokens": None, "cli_version": None, "model": None,
+                "reply_carries_own_turn_id": None}
     total, version, model = None, None, None
+    issued: set[str] = set()
+    echoed: set[str] = set()
     for line in newest.read_text(errors="replace").splitlines():
         try:
             record = json.loads(line)
@@ -150,13 +174,25 @@ def _rollout_run(home: Path, since: float) -> dict:
         # the one that actually priced the request.
         version = version or payload.get("cli_version")
         model = payload.get("model") or model
+        kind = record.get("type") or payload.get("type")
+        if kind == "turn_context" and isinstance(payload.get("turn_id"), str):
+            issued.add(payload["turn_id"])
+        if payload.get("role") == "assistant":
+            meta = payload.get("internal_chat_message_metadata_passthrough") or {}
+            if isinstance(meta, dict) and isinstance(meta.get("turn_id"), str):
+                echoed.add(meta["turn_id"])
         info = payload.get("info") or {}
         if not isinstance(info, dict):
             continue
         usage = info.get("total_token_usage") or {}
         if isinstance(usage, dict) and usage.get("input_tokens"):
             total = int(usage["input_tokens"])
-    return {"input_tokens": total, "cli_version": version, "model": model}
+    # `None` when either half is absent: a build that does not stamp turns this way has not
+    # told us the arms were served differently, and treating silence as a mismatch would
+    # refuse every measurement on it.
+    own = bool(echoed) and echoed <= issued if (issued and echoed) else None
+    return {"input_tokens": total, "cli_version": version, "model": model,
+            "reply_carries_own_turn_id": own}
 
 
 def _codex_probe(home: Path, workdir: Path, timeout: int) -> dict:
@@ -185,7 +221,8 @@ def _codex_probe(home: Path, workdir: Path, timeout: int) -> dict:
                 "error": f"input tokens ({total}) exceed the {CONTEXT_CEILING} ceiling; "
                          "this probe did work instead of measuring a prefix"}
     return {"ok": True, "input_tokens": total,
-            "cli_version": run["cli_version"], "model": run["model"]}
+            "cli_version": run["cli_version"], "model": run["model"],
+            "reply_carries_own_turn_id": run["reply_carries_own_turn_id"]}
 
 
 def _controlled_home(tmp: Path) -> Path:
@@ -298,6 +335,22 @@ def measure_instruction_cost(instruction_file: Path, *, pairs: int = PROBE_PAIRS
                          "file measured under a different build can differ while each run "
                          "still reports a spread of 0.",
     }
+    # Checked before the noise band, because a mixed route invalidates the difference at
+    # any magnitude: a large one is not evidence of loading and a small one is not evidence
+    # of its absence. Repeating the measurement does not address it, so this is reported as
+    # a condition to fix rather than as a figure with a caveat attached.
+    if common["measured_under"].get("arms_served_alike") is False:
+        return {
+            "ok": False,
+            "blocker": "ARMS_NOT_SERVED_ALIKE",
+            "loaded": "unproven",
+            "reason": "the arms' replies did not all carry the turn id this harness issued, "
+                      "so they were not all answered by the same route; a difference "
+                      "between them measures the routes rather than the file. More pairs "
+                      "cannot fix this — point the CLI straight at the model provider, or "
+                      "establish that the relay in front of it serves every request alike.",
+            **common,
+        }
     if mean <= MIN_DETECTABLE_TOKENS:
         return {
             "ok": False,

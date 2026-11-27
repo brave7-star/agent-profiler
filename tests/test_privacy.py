@@ -41,6 +41,20 @@ SYNTHETIC_UUIDS = {
 # A home directory in a fixture path is a placeholder, never a name.
 PLACEHOLDER_HOMES = {"u", "h"}
 
+# Hosts a tracked file may name. Every entry is reserved for examples by RFC 2606, so none
+# of them resolves to anything.
+#
+# This rule was missing, and the sweep had no shape that would have caught what it is for.
+# A CLI can be pointed at a relay instead of at the model provider, and that endpoint sits
+# in the harness config of the machine being profiled. Writing one into a comment while
+# explaining a measurement defect would publish which service this environment's requests
+# go through — the same class of fact as a session count, and arguably worse, because it
+# names a third party too. The mechanism is what belongs here: *a relay may answer two
+# identical requests differently*, which holds for any relay and names none.
+ALLOWED_HOSTS = {"x.invalid", "api.invalid", "example.invalid"}
+
+ENDPOINT = re.compile(r"\bhttps?://([A-Za-z0-9](?:[A-Za-z0-9.-]*[A-Za-z0-9])?)")
+
 MAGNITUDE = re.compile(r"\b\d{1,3}(?:,\d{3})+\b")
 _COUNTED_NOUN = (r"sessions?|records?|transcripts?|rollouts?|files?"
                  r"|bytes?|tokens?|chars?|characters?")
@@ -187,6 +201,23 @@ def test_no_path_in_the_repository_names_a_person():
     assert not named, named
 
 
+def test_no_tracked_file_names_a_service_this_environment_talks_to():
+    """A configured endpoint is a fact about the measured machine, not about the tool.
+
+    The gap this closes: the sweep had rules for identifiers, paths, magnitudes and
+    contact details, and none of them matched a URL. A diagnosis that turns on the presence
+    of a relay in front of the model provider is exactly the kind of note a developer
+    writes down with the endpoint beside it, and that endpoint names both the machine's
+    configuration and a third party.
+    """
+    named = {}
+    for name, text in _tracked():
+        bad = sorted({h for h in ENDPOINT.findall(text) if h not in ALLOWED_HOSTS})
+        if bad:
+            named[name] = bad
+    assert not named, named
+
+
 def test_nothing_in_the_repository_carries_contact_details_or_a_hostname():
     """The first history of this project put a real name and address in 15 commits before
     anyone looked. A machine name arrives the same way, through a pasted shell prompt."""
@@ -215,9 +246,20 @@ def test_each_rule_catches_the_leak_it_was_written_for():
         (HEX_ID, "verified on 0a1b2c3d, which is a session"),
         (EMAIL, "someone@example.com"),
         (HOSTNAME, "user@somebodysMacBook-Pro ~ %"),
+        # The endpoint class, which had no rule at all until a diagnosis turned on one.
+        (ENDPOINT, "base_url = https://relay.madeupvendor.test/v1"),
+        (ENDPOINT, "ANTHROPIC_BASE_URL=http://gateway.madeupvendor.test"),
     ]
     for pattern, sample in planted:
         assert pattern.search(sample), (pattern.pattern, sample)
+
+    # The endpoint rule is a declared set, not a shape, so the extraction has to be checked
+    # too: a pattern that matched but produced a host no allow-list could contain would
+    # fail every file, and one that produced nothing would pass every file.
+    assert ENDPOINT.findall("see https://relay.madeupvendor.test/v1 for the route") == \
+        ["relay.madeupvendor.test"]
+    assert not {h for h in ENDPOINT.findall("https://example.invalid/mcp")
+                if h not in ALLOWED_HOSTS}
 
     # And the rules must not fire on the shapes the repository legitimately contains.
     for pattern, sample in [
@@ -254,6 +296,10 @@ def test_this_file_does_not_quote_the_leaks_it_forbids():
     prose = [(SELF, "\n".join(chunks))]
     for pattern in (MAGNITUDE, COUNTED_CORPUS, MESSAGE_ID, UUID, HEX_ID, EMAIL, HOSTNAME):
         assert not _hits(prose, pattern), (pattern.pattern, _hits(prose, pattern))
+    # The endpoint rule applies to this file's prose through its allow-list, the same way
+    # it applies everywhere else: the samples it plants live in code, not in a docstring.
+    assert not {h for _, text in prose for h in ENDPOINT.findall(text)
+                if h not in ALLOWED_HOSTS}
 
 
 def main() -> int:

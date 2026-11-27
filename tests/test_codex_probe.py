@@ -429,16 +429,17 @@ def test_a_skipped_instruction_file_keeps_why_each_arm_failed():
 
 
 def _instruction_probe(*, versions=("0.150.0", "0.150.0"), models=("m-a", "m-a"),
-                       tokens=(1000, 1400)):
-    """A stub for the Codex arm probe, cycling through the given builds and models."""
+                       tokens=(1000, 1400), routes=(None, None)):
+    """A stub for the Codex arm probe, cycling through the given builds, models and routes."""
     state = {"n": 0}
 
     def stub(home, workdir, timeout):
-        i = state["n"] % len(versions)
+        n = state["n"]
         armed = (workdir / "AGENTS.md").is_file()
         state["n"] += 1
         return {"ok": True, "input_tokens": tokens[1] if armed else tokens[0],
-                "cli_version": versions[i], "model": models[i]}
+                "cli_version": versions[n % len(versions)], "model": models[n % len(models)],
+                "reply_carries_own_turn_id": routes[n % len(routes)]}
     return stub
 
 
@@ -461,7 +462,8 @@ def test_a_token_figure_records_the_build_and_model_that_produced_it():
             cp._codex_probe = original
 
     assert result["ok"] is True
-    assert result["measured_under"] == {"cli_version": "0.150.0", "model": "m-a"}
+    assert result["measured_under"] == {"cli_version": "0.150.0", "model": "m-a",
+                                        "arms_served_alike": None}
     # And the caveat has to travel with the figure, because a spread of 0 reads as
     # stability and is only agreement inside one window.
     assert "not stability across runs" in result["comparability"]
@@ -485,6 +487,115 @@ def test_arms_that_ran_under_different_builds_are_flagged_not_averaged():
     assert under["cli_version"] is None and under["model"] is None
     assert under["mixed"]["cli_versions"] == ["0.150.0", "0.151.0"]
     assert "not a clean measurement" in under["warning"]
+
+
+# Declared inventions, to the shape of the ids a harness stamps on a turn.
+ISSUED_TURN = "11111111-2222-3333-4444-555555555555"
+FOREIGN_TURN = "99999999-8888-7777-6666-555555555555"
+
+
+def _rollout(home: Path, *, issued, echoed, tokens: int = 14_000) -> None:
+    """A minimal rollout: one turn, one assistant reply, one usage report."""
+    records = [
+        {"type": "session_meta", "payload": {"cli_version": "0.150.0"}},
+        {"type": "turn_context", "payload": {"turn_id": issued, "model": "m-a"}},
+        {"type": "response_item", "payload": {
+            "type": "message", "role": "assistant",
+            **({"internal_chat_message_metadata_passthrough": {"turn_id": echoed}}
+               if echoed else {})}},
+        {"type": "event_msg", "payload": {
+            "type": "token_count",
+            "info": {"total_token_usage": {"input_tokens": tokens}}}},
+    ]
+    (home / "rollout-demo.jsonl").write_text(
+        "\n".join(json.dumps(r) for r in records) + "\n", encoding="utf-8")
+
+
+def test_a_reply_carrying_a_foreign_turn_id_is_read_as_another_route():
+    """The signal that a request was not answered the way the harness asked.
+
+    A CLI can be pointed at a relay instead of at the model provider, and a relay may
+    answer two identical requests by two routes. The harness stamps each turn and the reply
+    carries that stamp back, so a reply bearing an id the harness never issued went through
+    something in the middle.
+    """
+    with _tmp() as tmp:
+        _rollout(tmp, issued=ISSUED_TURN, echoed=ISSUED_TURN)
+        assert cp._rollout_run(tmp, 0)["reply_carries_own_turn_id"] is True
+    with _tmp() as tmp:
+        _rollout(tmp, issued=ISSUED_TURN, echoed=FOREIGN_TURN)
+        assert cp._rollout_run(tmp, 0)["reply_carries_own_turn_id"] is False
+    # Silence is not a mismatch: a build that does not stamp replies this way has told us
+    # nothing, and reading that as a mismatch would refuse every measurement on it.
+    with _tmp() as tmp:
+        _rollout(tmp, issued=ISSUED_TURN, echoed=None)
+        assert cp._rollout_run(tmp, 0)["reply_carries_own_turn_id"] is None
+
+
+def _differenced(**kw):
+    with _tmp() as tmp:
+        target = tmp / "AGENTS.md"
+        target.write_text("project rules\n", encoding="utf-8")
+        original = cp._codex_probe
+        cp._codex_probe = _instruction_probe(**kw)
+        try:
+            return cp.measure_instruction_cost(target, pairs=2)
+        finally:
+            cp._codex_probe = original
+
+
+def test_arms_answered_by_different_routes_are_refused_not_differenced():
+    """What two readings of one file that would not agree actually were.
+
+    The arms of each pair had been answered by different routes, so neither difference was
+    a reading of the file at all — the figures came from two accountings. Reporting a mean
+    and a spread described the routes. The condition is detectable from the harness's own
+    record, which makes it a refusal rather than a caveat.
+    """
+    result = _differenced(routes=(True, False))
+    assert result["ok"] is False
+    assert result["blocker"] == "ARMS_NOT_SERVED_ALIKE"
+    assert result["loaded"] == "unproven"
+    assert result["measured_under"]["arms_served_alike"] is False
+    # And it must say what would address it, because repeating the run will not.
+    assert "More pairs cannot fix this" in result["reason"]
+    # The observations are kept: they are what the refusal rests on.
+    assert result["differences"] and result["pairs"]
+
+
+def test_a_mixed_route_is_refused_at_any_magnitude():
+    """Checked before the noise band on purpose.
+
+    A mixed route invalidates the difference at any magnitude: a large one is not evidence
+    that the file was loaded, and a small one is not evidence that it was not. A big route
+    gap must not be published as `loaded: proven` with a cost attached — and a small one
+    must not be filed under the noise band, which would name drift as the reason when the
+    arms were not comparable in the first place.
+    """
+    big = _differenced(routes=(True, False), tokens=(1_000, 40_000))
+    assert big["ok"] is False and big["blocker"] == "ARMS_NOT_SERVED_ALIKE"
+    assert "loaded_evidence" not in big
+
+    # Inside the noise band, which is what pins the order of the two checks.
+    small = _differenced(routes=(True, False),
+                         tokens=(1_000, 1_000 + cp.MIN_DETECTABLE_TOKENS - 1))
+    assert small["ok"] is False and small["blocker"] == "ARMS_NOT_SERVED_ALIKE"
+    assert "inconclusive" not in small
+
+
+def test_a_build_that_does_not_report_the_route_still_measures():
+    """The guard must not become a blanket refusal on builds that say nothing about it."""
+    result = _differenced(routes=(None, None))
+    assert result["ok"] is True
+    assert result["loaded"] == "proven"
+    assert result["measured_under"]["arms_served_alike"] is None
+
+
+def test_one_route_throughout_is_what_a_clean_measurement_looks_like():
+    """The positive case, so the refusal above is not vacuous."""
+    result = _differenced(routes=(True, True))
+    assert result["ok"] is True
+    assert result["measured_under"]["arms_served_alike"] is True
 
 
 def main() -> int:
