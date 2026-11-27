@@ -1471,6 +1471,22 @@ def test_the_standing_is_never_merged_into_one_score():
         assert d["limit"] and d["limit"] in text
 
 
+def test_a_single_directory_report_says_its_figures_are_a_subset():
+    """The tool exists to answer "how is my whole environment", and a run without `--all`
+    answers a narrower question. On a real machine the narrow run's token total was under a
+    third of the environment's, with nothing in the output saying so — a reader has no
+    second figure to compare against, so they take it for the whole picture."""
+    with _env(_trace([("mcp__s__go", {"q": "x"})]), {"s": {"command": "x"}}) as root:
+        narrow = report_root(str(root))
+        wide = report_root(str(root), whole_environment=True)
+    assert narrow["scope"] == "project"
+    assert wide["scope"] == "whole_environment"
+    assert "--all" in narrow["text"]
+    # And the wider run must not carry the caveat, or it becomes noise that gets ignored
+    # on the run where it would have mattered.
+    assert "只看这个目录" not in wide["text"] and "this directory only" not in wide["text"]
+
+
 def test_the_standing_block_is_absent_when_there_is_nothing_to_say():
     assert rp._standing_lines({}) == []
     assert rp._standing_lines({"dimensions": []}) == []

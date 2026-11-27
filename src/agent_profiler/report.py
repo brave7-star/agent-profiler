@@ -1044,6 +1044,20 @@ def _render(data: dict) -> str:
         "",
     ]
 
+    # What this report covers. The tool exists to answer "how is my whole agent
+    # environment", and a run without `--all` answers a narrower question with figures that
+    # are a subset of the environment's. Said here rather than left for the reader to infer
+    # from a token total they have nothing to compare against.
+    if data.get("scope") == "project":
+        lines += [tr(
+            en="**Scope: this directory only.** Transcripts and per-project declarations "
+               "outside it are not included, so every figure below is a subset of the "
+               "environment's. Add `--all` for the whole environment, which is the question "
+               "this tool is for.",
+            zh="**范围：只看这个目录。** 它之外的会话记录和按项目声明的东西都没有计入，"
+               "所以下面每个数字都只是整套环境的一部分。要看整套环境，加 `--all` —— "
+               "那才是这个工具要回答的问题。"), ""]
+
     # Where the cost figures came from. A report that silently used measurements taken weeks
     # ago reads as though it measured something this run, and the reader has no way to tell
     # a fresh figure from a remembered one.
@@ -2181,6 +2195,11 @@ def report_root(root: str, *, evaluation_path: str | None = None,
         # nobody ran, so it is surfaced rather than silently weakening a link.
         "unmatched_measurements": orphans,
         "relocation_candidates": traces["observed"].get("relocation_candidates") or [],
+        # What this report is about. A single-root run answers a narrower question than the
+        # one the tool exists for, and its figures are a subset of the environment's — on a
+        # real machine, under a third of the token total. Reporting the narrow answer without
+        # naming its scope lets a reader take it for the whole picture.
+        "scope": "whole_environment" if whole_environment else "project",
         # Whether the cost figures were supplied, remembered, or absent. Without this a
         # reader cannot tell a figure measured this run from one kept weeks ago.
         "measurement_source": {
