@@ -35,16 +35,20 @@ from pathlib import Path
 
 from .i18n import count, tr
 from .score import (
+    ASSUMED,
+    DEFAULT_PROFILE,
     EVIDENCE_LINKS,
     INSTRUCTION_KINDS,
     NO_EVENT_EMITTED,
     PARTIAL,
+    PREFERENCES_FILENAME,
     PROVEN,
     SCORED_LINKS,
     UNPROVEN,
     EMPTY_TEXT,
     NO_RULE,
     NO_TEXT,
+    load_preferences,
     _coverage,
     _measurability_totals,
     _next_measurement,
@@ -307,6 +311,13 @@ def _collect(root: str, limit: int | None, evaluation_path: str | None,
     useful = None
     if useful_path:
         useful = json.loads(Path(useful_path).read_text(encoding="utf-8"))
+    else:
+        # `useful` is paid for too, and it is one of the three links a verdict needs — so
+        # without this a report run with no flags produced *no verdicts at all*, however
+        # much had been spent proving usefulness.
+        from .store import USEFUL_KEYS, stored
+
+        useful = stored(keys=USEFUL_KEYS)
     return scan, traces, evaluation, useful, shared, codex_usage
 
 
@@ -637,6 +648,11 @@ def _verdicts(components: list[dict], profile: str) -> list[dict]:
             "score": scored["score"],
             "signals": scored["signals"],
             "stable_across_profiles": component["sensitivity"].get("stable"),
+            # How far the score moves across weightings, and how many were compared. Both
+            # are rendered, so the caveat describes what was actually checked rather than a
+            # fixed number of profiles this tool happens to ship with.
+            "spread": component["sensitivity"].get("spread"),
+            "profiles_compared": len(component["sensitivity"].get("profiles") or {}),
             "cost_value": cost["value"],
             "cost_unit": cost.get("unit"),
             "cost_status": cost["status"],
@@ -936,25 +952,57 @@ def _always_on_lines(rows: list[dict], sessions: int) -> list[str]:
     return lines
 
 
-def _verdict_lines(verdicts: list[dict], profile: str) -> list[str]:
+def _verdict_lines(verdicts: list[dict], profile: str, weights: dict | None = None,
+                   assumed: bool = True) -> list[str]:
     if not verdicts:
         return []
+    # The weights themselves, and how to replace them. Saying "these are an assumption" and
+    # naming neither the numbers nor the file that overrides them left the reader with an
+    # objection and no lever: the machinery to supply real weights existed the whole time,
+    # reachable only from a command most readers never run.
+    shown = ", ".join(f"{k} {v:.2f}" for k, v in sorted((weights or {}).items()))
     lines = [tr(en="## Components that can be given a verdict", zh="## 能给出结论的组件"), "",
              tr(en=f"These have used / useful / cost all three, scored under the "
-                   f"`{profile}` weights. The weights are this tool's assumption, not "
-                   f"preferences you supplied.",
-                zh=f"下面是「用过、有用、成本」三环齐备的组件，按 `{profile}` 权重打分。"
-                   f"权重是本工具的假设，不是你给的偏好。"), ""]
+                   f"`{profile}` weights ({shown}).",
+                zh=f"下面是「用过、有用、成本」三环齐备的组件，按 `{profile}` 权重打分"
+                   f"（{shown}）。"), ""]
+    if assumed:
+        lines += [tr(
+            en=f"Those weights are this tool's hypothesis, not preferences you supplied. To "
+               f"use your own, put them in `{PREFERENCES_FILENAME}` at the root, or pass "
+               f"`--preferences FILE`:\n"
+               f"```json\n"
+               f'{{"profiles": {{"mine": {{"weights": '
+               f'{{"cost": 0.6, "used": 0.3, "useful": 0.1}}}}}}}}\n'
+               f"```",
+            zh=f"这组权重是本工具的假设，不是你给的偏好。想用你自己的，把它放在根目录的 "
+               f"`{PREFERENCES_FILENAME}` 里，或者用 `--preferences FILE` 传进来：\n"
+               f"```json\n"
+               f'{{"profiles": {{"mine": {{"weights": '
+               f'{{"cost": 0.6, "used": 0.3, "useful": 0.1}}}}}}}}\n'
+               f"```"), ""]
+    else:
+        lines += [tr(en="These are the weights **you** supplied, not this tool's assumption.",
+                     zh="这是**你自己**给的权重，不是本工具的假设。"), ""]
     for v in verdicts:
         units = {"tokens_per_request": tr(en="tokens/request", zh="token/次"),
                  "usd": tr(en="USD/request", zh="美元/次")}
         unit = units.get(v["cost_unit"], v["cost_unit"])
         cost = (f"{v['cost_value']:,} {unit}" if v["cost_value"] is not None
                 else tr(en="unknown", zh="未知"))
-        stable = (tr(en="same verdict under all three weightings", zh="三种权重下结论一致")
+        # What moves across weightings is the *score*, not the verdict: only "keep" can be
+        # reached from this evidence, so nothing can flip to "remove". Saying it flips
+        # claimed a reversal the tool is not able to produce. The count of weightings is
+        # read from the data too, because it used to say "all three" — true of this tool's
+        # own profiles and wrong the moment a reader supplied their own.
+        spread = v.get("spread")
+        weighings = count(v.get("profiles_compared") or 0, "weighting")
+        stable = (tr(en=f"score holds across {weighings}",
+                     zh=f"{v.get('profiles_compared') or 0} 组权重下得分基本一致")
                   if v["stable_across_profiles"]
-                  else tr(en="**flips under a different weighting**",
-                          zh="**换一组权重结论就变**"))
+                  else tr(en=f"**the weighting moves this score by {spread}**, more than the "
+                             f"evidence does",
+                          zh=f"**换权重会让这个得分变动 {spread}**，比证据本身的影响更大"))
         lines += [
             tr(en=f"- **{v['name']}: keep** ({profile} score {v['score']}, {stable})",
                zh=f"- **{v['name']}：建议保留**（{profile} 得分 {v['score']}，{stable}）"),
@@ -1126,7 +1174,9 @@ def _render(data: dict) -> str:
         *_finding_lines(data["findings"], data),
         # The verdict next: it is the one place a component gets a conclusion, and on an
         # environment with none this section simply does not exist.
-        *_verdict_lines(data.get("verdicts") or [], data.get("profile", "balanced")),
+        *_verdict_lines(data.get("verdicts") or [], data.get("profile", DEFAULT_PROFILE),
+                        (data.get("weights") or {}).get("in_force"),
+                        data.get("preference_source", ASSUMED) == ASSUMED),
         *_duplicate_lines(data["diverged_duplicates"]),
         *_always_on_lines(data["always_on"], data["sessions"]),
         *_reliability_lines(data["reliability"]),
@@ -2139,19 +2189,34 @@ def _headline(components: list[dict], link_coverage: dict, stack: dict) -> str:
 
 
 def report_root(root: str, *, evaluation_path: str | None = None,
-                limit: int | None = None, profile: str = "balanced",
+                limit: int | None = None, profile: str | None = None,
+                preferences_path: str | None = None,
                 whole_environment: bool = False, exclusions: dict | None = None,
                 useful_path: str | None = None, use_cache: bool = True) -> dict:
     """Assemble every stage's evidence into a readable report.
 
     With `whole_environment` the subject is the environment rather than one directory,
     which is the question this tool exists to answer.
+
+    Weights reach this command the same way they reach `score`. They used to not: `profile`
+    was a bare string defaulting to one of the tool's own hypotheses, with no way to supply
+    real ones — while the report said in prose that the weights were an assumption and named
+    nothing a reader could do about it.
     """
     if not root or not root.strip():
         raise ValueError("root must not be empty")
     base = Path(root).expanduser().resolve()
     if not base.is_dir():
         raise NotADirectoryError(f"root is not a directory: {base}")
+
+    profiles, preference_source, preferences_origin = load_preferences(preferences_path, base)
+    if profile is None:
+        # With real preferences there is no sensible default, so the first supplied profile
+        # wins rather than the tool's own `balanced`, which may not even be defined there.
+        profile = DEFAULT_PROFILE if DEFAULT_PROFILE in profiles else next(iter(profiles))
+    if profile not in profiles:
+        raise ValueError(f"unknown profile: {profile}; available: "
+                         f"{', '.join(sorted(profiles))}")
 
     started = time.perf_counter()
     scan, traces, evaluation, useful, shared, codex_usage = _collect(
@@ -2168,9 +2233,11 @@ def report_root(root: str, *, evaluation_path: str | None = None,
         component["useful_measurability"] = useful_measurability(component, components)
         component["next_measurement"] = _next_measurement(component)
         # Stability across profiles is part of the verdict, not a footnote: a conclusion
-        # that only survives one set of invented weights is a property of the weights.
+        # that only survives one set of weights is a property of the weights. Checked
+        # against whichever profiles are in force — the supplied ones when there are any,
+        # since stability across the tool's own hypotheses says nothing about a reader's.
         if component["coverage"]["scorable"]:
-            component["sensitivity"] = sensitivity(component)
+            component["sensitivity"] = sensitivity(component, profiles)
 
     link_coverage = {
         link: {
@@ -2181,7 +2248,7 @@ def report_root(root: str, *, evaluation_path: str | None = None,
         for link in SCORED_LINKS
     }
     scorable = [c for c in components if c["coverage"]["scorable"]]
-    stack = _stack_score(scorable, components, profile)
+    stack = _stack_score(scorable, components, profile, profiles)
     scan_observed = scan["observed"]
 
     data = {
@@ -2236,6 +2303,17 @@ def report_root(root: str, *, evaluation_path: str | None = None,
         "reliability": _reliability(traces),
         "verdicts": _verdicts(components, profile),
         "profile": profile,
+        # Whether the weights behind every verdict were supplied or invented here, with the
+        # numbers themselves. A reader cannot audit a score whose weights are not printed,
+        # and `score` reported this while `report` did not — so the command most people run
+        # was the one that kept its weights to itself.
+        "preference_source": preference_source,
+        "preferences_file": preferences_origin,
+        "weights": {
+            "in_force": profiles[profile]["weights"],
+            "available": sorted(profiles),
+            "supplied_by_user": preference_source != ASSUMED,
+        },
         "cost": _cost_lines(traces, evaluation, shared),
         # Per component, never summed; see `_carried_lines`.
         "carried": _carried_lines(components),

@@ -279,7 +279,8 @@ commands on your own machine and you get your own.
 ./bin/agent-profiler collect   (--root PATH | --session FILE) [--all] [--limit N]
 ./bin/agent-profiler normalize (--root PATH | --session FILE) [--all] [--harness H] [--events-out FILE]
 ./bin/agent-profiler analyze   (--root PATH | --session FILE) [--all] [--full]
-./bin/agent-profiler report    --root PATH [--all] [--evaluation FILE] [--useful FILE] [--format text|json]
+./bin/agent-profiler report    --root PATH [--all] [--evaluation FILE] [--useful FILE]
+                               [--profile P] [--preferences FILE] [--format text|json]
 ./bin/agent-profiler score     --root PATH [--all] [--profile P] [--preferences FILE] [--evaluation FILE] [--useful FILE]
 ./bin/agent-profiler verify    [--limit N] [--format text|json]
 ./bin/agent-profiler judge     --root PATH [--tier T] [--dry-run] [--force]
@@ -310,7 +311,15 @@ flips between profiles is one the evidence does not determine, and the honest ou
 flip.
 
 Real weights go in `agent-profiler-preferences.json` at the project root, or `--preferences`.
-See `docs/preferences.example.json`.
+See `docs/preferences.example.json`. Both `report` and `score` take them: the loader was
+reachable only from `score` for a while, which is the command most readers never run — so the
+report stated that its weights were an assumption and named nothing anyone could do about it.
+It now prints the weights in force and, when they are the tool's own, how to replace them.
+
+Sensitivity is checked against **whichever profiles are in force**. Stability across this
+tool's three hypotheses says nothing about a reader's own weights, and a verdict's caveat
+names the spread rather than claiming the verdict flips — only "keep" is reachable from this
+evidence, so nothing can flip to "remove".
 
 A stack total is withheld for any component missing `used`, `useful` or `cost`. Ranking on
 whichever links happen to be measured would rank the best-evidenced component worst, which is
@@ -335,7 +344,7 @@ while the bytecode ran another.
 for f in tests/test_*.py; do PYTHONPATH=src python3 -B "$f"; done
 ```
 
-488 regression tests, each pinned to a defect or a format property observed in a real run
+493 regression tests, each pinned to a defect or a format property observed in a real run
 rather than to a hypothetical. No test spends a token.
 
 ## Format notes

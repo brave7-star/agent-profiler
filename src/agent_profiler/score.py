@@ -1857,6 +1857,10 @@ def score_root(root: str, *, profile: str | None = None, evaluation_path: str | 
     if useful_path:
         import json
         useful = json.loads(Path(useful_path).read_text(encoding="utf-8"))
+    else:
+        from .store import USEFUL_KEYS, stored
+
+        useful = stored(keys=USEFUL_KEYS)
 
     # One pass, for the reason `report._collect` has one: these two ask different questions
     # of the same rollouts, and calling them in turn read the whole Codex corpus twice.

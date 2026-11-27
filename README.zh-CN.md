@@ -237,7 +237,8 @@ skill 臂会把使用者自己的指令文件从**两个臂里都**清掉，所�
 ./bin/agent-profiler collect   (--root PATH | --session FILE) [--all] [--limit N]
 ./bin/agent-profiler normalize (--root PATH | --session FILE) [--all] [--harness H] [--events-out FILE]
 ./bin/agent-profiler analyze   (--root PATH | --session FILE) [--all] [--full]
-./bin/agent-profiler report    --root PATH [--all] [--evaluation FILE] [--useful FILE] [--format text|json]
+./bin/agent-profiler report    --root PATH [--all] [--evaluation FILE] [--useful FILE]
+                               [--profile P] [--preferences FILE] [--format text|json]
 ./bin/agent-profiler score     --root PATH [--all] [--profile P] [--preferences FILE] [--evaluation FILE] [--useful FILE]
 ./bin/agent-profiler verify    [--limit N] [--format text|json]
 ./bin/agent-profiler judge     --root PATH [--tier T] [--dry-run] [--force]
@@ -264,7 +265,13 @@ skill 臂会把使用者自己的指令文件从**两个臂里都**清掉，所�
 本身。
 
 真实权重放在项目根目录的 `agent-profiler-preferences.json`，或者用 `--preferences` 指定。
-参见 `docs/preferences.example.json`。
+参见 `docs/preferences.example.json`。`report` 和 `score` 都收这两个参数：有一段时间它只能从
+`score` 进去，而那是多数人根本不会跑的命令 —— 于是报告一边说「这组权重是本工具的假设」，一边
+没告诉任何人该怎么换掉它。现在报告会把生效的权重打出来，如果是工具自己假设的，还会写明怎么替换。
+
+稳定性是对着**当前生效的那组 profile**算的。在本工具自己那三组假设下稳定，对读者自己的权重
+什么都没说；而结论的提示语给的是得分变动幅度，不是声称「结论会变」—— 这套证据只能得出「保留」，
+没有东西能翻成「删掉」。
 
 任何组件缺 `used`、`useful` 或 `cost`，整套环境的总分就被扣住。拿「恰好测到了哪几环」来排名，
 会把证据最充分的组件排到最差——而这正是这个阶段存在要避免的那个具体失败。
@@ -286,7 +293,7 @@ PYTHONPATH=src python3 -B -m agent_profiler.cli verify     # 和那个壳等价
 for f in tests/test_*.py; do PYTHONPATH=src python3 -B "$f"; done
 ```
 
-488 个回归测试，每一个都钉在一个真实运行里观察到的缺陷或格式性质上，而不是钉在某个假想情况上。
+493 个回归测试，每一个都钉在一个真实运行里观察到的缺陷或格式性质上，而不是钉在某个假想情况上。
 没有任何测试花掉一个 token。
 
 ## 格式笔记

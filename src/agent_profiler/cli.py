@@ -13,7 +13,8 @@ from .verify import verify, verify_text
 from .evaluate import evaluate_root
 from .judge import BUDGET_TIERS, judge_root
 from .report import report_root
-from .score import PREFERENCE_PROFILES, DEFAULT_PROFILE, score_root
+from .score import (PREFERENCE_PROFILES, PREFERENCES_FILENAME, DEFAULT_PROFILE,
+                    score_root)
 from .events import normalize_root, normalize_session, write_events
 from .traces import collect_root, collect_session, discover_sessions
 from .useful_probe import measure_useful
@@ -132,6 +133,16 @@ def main(argv=None):
     x.add_argument("--root", required=True)
     x.add_argument("--evaluation", help="a stage-6 evaluate artifact, to supply measured cost")
     x.add_argument("--useful", help="a measure-useful artifact, to supply the useful link")
+    # The same two flags `score` has. Without them on `report` the weights were reachable
+    # only from a command most readers never run, while the report itself said the weights
+    # were an assumption and gave no way to replace them.
+    x.add_argument("--profile",
+                   help="which preference profile to weigh verdicts with; with no "
+                        "--preferences file these are this tool's own hypotheses, not "
+                        "anyone's actual settings")
+    x.add_argument("--preferences",
+                   help=f"JSON file of real preference weights; {PREFERENCES_FILENAME} at "
+                        f"the root is read automatically when present")
     x.add_argument("--limit", type=int)
     x.add_argument("--format", choices=("text", "json"), default="text")
     x.add_argument("--output")
@@ -142,8 +153,8 @@ def main(argv=None):
                    help="which preference profile to score with; with no --preferences file "
                         "these are this tool's own hypotheses, not anyone's actual settings")
     x.add_argument("--preferences",
-                   help="JSON file of real preference weights; without it the output says "
-                        "the weights were assumed")
+                   help=f"JSON file of real preference weights; {PREFERENCES_FILENAME} at "
+                        f"the root is read automatically when present")
     x.add_argument("--evaluation", help="a stage-6 evaluate artifact, to supply the cost link")
     x.add_argument("--useful", help="a measure-useful artifact, to supply the useful link")
     x.add_argument("--limit", type=int)
@@ -244,6 +255,7 @@ def main(argv=None):
                               whole_environment=a.whole_environment)
         elif a.cmd == "report":
             data = report_root(a.root, evaluation_path=a.evaluation, limit=a.limit,
+                               profile=a.profile, preferences_path=a.preferences,
                                whole_environment=a.whole_environment,
                                exclusions=_exclusions_for(a, a.root),
                                useful_path=a.useful, use_cache=a.use_cache)
@@ -270,6 +282,7 @@ def main(argv=None):
             data = measure_useful(a.root, repeats=a.repeats, timeout=a.timeout,
                                   whole_environment=a.whole_environment,
                                   exclusions=_exclusions_for(a, a.root))
+            _keep(data, "measure-useful")
         elif a.cmd == "measure-skills":
             data = measure_skills(a.root, pairs=a.pairs, timeout=a.timeout,
                                   whole_environment=a.whole_environment, only=a.only)

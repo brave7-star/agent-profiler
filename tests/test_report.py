@@ -1150,7 +1150,8 @@ def test_a_scorable_component_is_actually_shown_to_the_reader():
     verdicts = [{
         "name": "AGENTS.md (~)", "kind": "agents_md", "verdict": "keep", "score": 0.9082,
         "signals": {"used": 1.0, "useful": 1.0, "cost": 0.7246},
-        "stable_across_profiles": True, "cost_value": 450,
+        "stable_across_profiles": True, "spread": 0.02, "profiles_compared": 3,
+        "cost_value": 450,
         "cost_unit": "tokens_per_request", "cost_status": "partial",
         "basis": "带这个文件的那一组「任务号写在标题末尾」每次都做到，不带的一次都没做到",
         "basis_evidence": "the arm carrying this file satisfied 1 stated rule in every valid run",
@@ -1163,11 +1164,121 @@ def test_a_scorable_component_is_actually_shown_to_the_reader():
     # is the one place a person goes to find a conclusion.
     assert "每次都做到" in text and "stated rule" not in text
     assert "450 token/次" in text          # the unit is spelled out, not left as a bare number
-    assert "三种权重下结论一致" in text
+    # The number of weightings is read from the data: it used to say "all three", true of
+    # this tool's own profiles and wrong the moment a reader supplies their own.
+    assert "3 组权重下得分基本一致" in text
     assert "只说保留" in text              # and the limit travels with it
 
     # An environment with nothing scorable gets no section at all, not an empty heading.
     assert rp._verdict_lines([], "balanced") == []
+
+
+def test_the_report_accepts_the_readers_own_weights():
+    """The weights machinery existed from the start and was reachable only from `score`, a
+    command most readers never run. `report` — the one they do run — defaulted to one of the
+    tool's own hypotheses, said in prose that the weights were an assumption, and offered no
+    way to replace them. An objection with no lever next to it."""
+    prefs = {"profiles": {"token_hawk": {"description": "spend dominates",
+                                         "weights": {"cost": 0.7, "used": 0.2,
+                                                     "useful": 0.1}}}}
+    with _env(_trace([("mcp__s__go", {"q": "x"})]), {"s": {"command": "x"}}) as root:
+        (root / "prefs.json").write_text(json.dumps(prefs), encoding="utf-8")
+        mine = report_root(str(root), preferences_path=str(root / "prefs.json"))
+        assumed = report_root(str(root))
+    assert mine["profile"] == "token_hawk"
+    assert mine["weights"]["in_force"]["cost"] == 0.7
+    assert mine["weights"]["supplied_by_user"] is True
+    # And the default still says plainly that nobody supplied these.
+    assert assumed["weights"]["supplied_by_user"] is False
+    assert assumed["preference_source"] == rp.ASSUMED
+
+
+def test_a_preferences_file_at_the_root_is_found_without_a_flag():
+    """Matching how exclusions already work, because a reader who has written the file once
+    should not have to name it on every run."""
+    prefs = {"profiles": {"mine": {"weights": {"cost": 0.5, "used": 0.4, "useful": 0.1}}}}
+    with _env(_trace([("mcp__s__go", {"q": "x"})]), {"s": {"command": "x"}}) as root:
+        (root / rp.PREFERENCES_FILENAME).write_text(json.dumps(prefs), encoding="utf-8")
+        data = report_root(str(root))
+    assert data["profile"] == "mine"
+    assert data["weights"]["in_force"]["used"] == 0.4
+
+
+def test_an_unknown_profile_is_an_error_not_a_silent_default():
+    """Falling back to the tool's own weights for a profile the reader asked for by name
+    would answer a different question than the one asked."""
+    with _env(_trace([("mcp__s__go", {"q": "x"})]), {"s": {"command": "x"}}) as root:
+        try:
+            report_root(str(root), profile="nonexistent")
+        except ValueError as exc:
+            assert "nonexistent" in str(exc) and "balanced" in str(exc)
+        else:
+            raise AssertionError("an unknown profile must not be accepted")
+
+
+def test_the_report_tells_the_reader_how_to_supply_weights():
+    """Naming neither the numbers nor the file that overrides them left the reader able to
+    see the caveat and unable to act on it."""
+    verdicts = [{"name": "x", "kind": "skills", "verdict": "keep", "score": 0.5,
+                 "signals": {}, "stable_across_profiles": True, "spread": 0.0,
+                 "profiles_compared": 3, "cost_value": 1,
+                 "cost_unit": "tokens_per_request", "cost_status": "partial",
+                 "basis": "b", "limit": "l"}]
+    weights = {"cost": 1 / 3, "used": 1 / 3, "useful": 1 / 3}
+    assumed = "\n".join(rp._verdict_lines(verdicts, "balanced", weights, True))
+    # The numbers in force, so a score can be audited rather than taken on faith.
+    assert "cost 0.33" in assumed
+    assert rp.PREFERENCES_FILENAME in assumed and "--preferences" in assumed
+    # With supplied weights the instructions are gone and the provenance is stated.
+    supplied = "\n".join(rp._verdict_lines(verdicts, "mine", weights, False))
+    assert rp.PREFERENCES_FILENAME not in supplied
+    assert "你自己" in supplied or "you** supplied" in supplied
+
+
+def test_stability_is_checked_against_whichever_weights_are_in_force():
+    """Stability across the tool's own hypotheses says nothing about a reader's. Checking
+    the wrong set would report "the weights do not matter here" on evidence from weights
+    nobody is using.
+
+    Asserted through `report_root` rather than on `sensitivity` alone, because the defect
+    would be in the *plumbing*: calling `sensitivity` without the supplied profiles passes
+    every direct test of that function while the report still compares the wrong set.
+    """
+    prefs = {"profiles": {
+        "a": {"weights": {"cost": 1.0, "used": 0.0, "useful": 0.0}},
+        "b": {"weights": {"cost": 0.0, "used": 0.0, "useful": 1.0}}}}
+    with _env(_trace([("mcp__s__go", {"q": "x"})] * 3), {"s": {"command": "x"}}) as root:
+        (root / "p.json").write_text(json.dumps(prefs), encoding="utf-8")
+        # A real instruction file, because the useful and cost measurements join to a
+        # component by its absolute path: a measurement of a file that is not there joins to
+        # nothing, and nothing becomes scorable.
+        instructions = root / "CLAUDE.md"
+        instructions.write_text("- end the title with the task id\n", encoding="utf-8")
+        measured = str(instructions.resolve())
+        useful = {"useful_measurements": [
+            {"ok": True, "useful": "proven", "file": measured,
+             "rules_proven": ["task_id_at_title_end"],
+             "useful_evidence": "the arm carrying this file satisfied 1 stated rule"}]}
+        cost = {"instruction_measurements": [
+            {"ok": True, "file": measured, "loaded": "proven", "mean_tokens": 450,
+             "harness": "claude_code", "reproducible": True,
+             "differences": [450, 450], "pair_spread_tokens": 0,
+             "loaded_evidence": "injecting this file moved the fixed prefix"}]}
+        data = report_root(str(root), preferences_path=str(root / "p.json"),
+                           evaluation_path=_json_file(cost),
+                           useful_path=_json_file(useful))
+    compared = {p for c in data["components"] if c.get("sensitivity")
+                for p in c["sensitivity"]["profiles"]}
+    assert compared, "the fixture must reach a scorable component, or this proves nothing"
+    assert compared == {"a", "b"}, compared
+
+
+def _json_file(payload):
+    """An artifact on disk, for a test that supplies one through a path argument."""
+    handle = tempfile.NamedTemporaryFile("w", suffix=".json", delete=False)
+    json.dump(payload, handle)
+    handle.close()
+    return handle.name
 
 
 def test_the_useful_verdict_is_rendered_from_the_rule_names_not_translated():
@@ -1189,11 +1300,16 @@ def test_the_useful_verdict_is_rendered_from_the_rule_names_not_translated():
 
 def test_an_unstable_verdict_says_so_rather_than_reading_as_settled():
     verdicts = [{"name": "x", "kind": "skills", "verdict": "keep", "score": 0.5,
-                 "signals": {}, "stable_across_profiles": False, "cost_value": 1,
+                 "signals": {}, "stable_across_profiles": False, "spread": 0.31,
+                 "profiles_compared": 2, "cost_value": 1,
                  "cost_unit": "tokens_per_request", "cost_status": "partial",
                  "basis": "b", "limit": "l"}]
     text = "\n".join(rp._verdict_lines(verdicts, "balanced"))
-    assert "换一组权重结论就变" in text
+    # What moves is the score, not the verdict: only "keep" is reachable from this evidence,
+    # so nothing can flip to "remove", and saying it flips claimed a reversal the tool
+    # cannot produce. The spread is named so the reader can judge how much it matters.
+    assert "0.31" in text and "比证据本身的影响更大" in text
+    assert "结论就变" not in text
 
 
 def test_the_next_steps_preamble_tracks_what_has_actually_been_proven():

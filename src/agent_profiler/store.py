@@ -38,7 +38,16 @@ from pathlib import Path
 
 # The merge keys scoring already understands. A stored run that carries none of these holds
 # no measurement, so it contributes nothing and is not an error either.
-MEASUREMENT_KEYS = ("instruction_measurements", "skill_measurements", "evaluations")
+COST_KEYS = ("instruction_measurements", "skill_measurements", "evaluations")
+# `measure-useful` is paid too — the dearest of the probes per component — and it answers a
+# different link, so it is read back through `--useful` rather than `--evaluation`. Storing
+# only the cost artifacts left the most expensive measurement in the project with nowhere to
+# live, and a report run without the flag showed no verdicts at all, because `useful` is one
+# of the three links a verdict requires.
+# One key, because that is the one the scoring stage reads. Listing a second plausible name
+# here would be a key nothing ever consumes.
+USEFUL_KEYS = ("useful_measurements",)
+MEASUREMENT_KEYS = COST_KEYS + USEFUL_KEYS
 
 STORE_SCHEMA = "1"
 
@@ -125,8 +134,12 @@ def remember(data: dict, *, stage: str) -> Path | None:
     return None
 
 
-def stored(directory: Path | None = None) -> dict | None:
+def stored(directory: Path | None = None, *, keys: tuple = COST_KEYS) -> dict | None:
     """Every measurement kept so far, merged into one artifact, or None if there are none.
+
+    `keys` selects which link's measurements to return, because the two artifacts are read
+    back through different arguments: cost through `--evaluation`, usefulness through
+    `--useful`. Merging both into one dict would hand each consumer the other's rows.
 
     The merge is a concatenation per key, deliberately: two measurements of one file are two
     observations, and the scoring stage reports a disagreement between them instead of
@@ -139,7 +152,7 @@ def stored(directory: Path | None = None) -> dict | None:
     directory = directory or store_dir()
     if not directory.is_dir():
         return None
-    merged: dict = {key: [] for key in MEASUREMENT_KEYS}
+    merged: dict = {key: [] for key in keys}
     sources: list[str] = []
     unreadable: list[str] = []
     for path in sorted(directory.glob("*.json")):
@@ -152,7 +165,7 @@ def stored(directory: Path | None = None) -> dict | None:
             unreadable.append(path.name)
             continue
         found = False
-        for key in MEASUREMENT_KEYS:
+        for key in keys:
             rows = [r for r in (data.get(key) or []) if _is_measurement(r)]
             if rows:
                 merged[key].extend(rows)
