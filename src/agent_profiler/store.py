@@ -43,16 +43,50 @@ MEASUREMENT_KEYS = ("instruction_measurements", "skill_measurements", "evaluatio
 STORE_SCHEMA = "1"
 
 
+def _is_measurement(row: object) -> bool:
+    """Whether a row records something that was actually measured.
+
+    These lists are not all measurements. `evaluate` emits one row per candidate whatever
+    happens, including rows for candidates its spend gate *refused* and for servers excluded
+    by request — rows that exist to say why no measurement was taken. Storing those filled
+    the store with entries carrying `status: not_measured`, so `sources` counted files that
+    contributed nothing, and a report's "cost figures come from N measurements" named a
+    number larger than the evidence behind it.
+    """
+    if not isinstance(row, dict):
+        return False
+    status = row.get("status")
+    if isinstance(status, str) and status != "measured":
+        return False
+    # A probe that failed is reported, never stored as a result: the artifact says `ok:
+    # false`, and keeping it would let a failure read downstream as a reading.
+    return row.get("ok") is not False
+
+
 def store_dir() -> Path:
     """Where measurements are kept.
 
-    `AGENT_PROFILER_STORE` overrides it, which is what lets the tests run against a
-    temporary directory instead of the developer's own history — the same discipline the
-    harness homes already follow.
+    A measurement describes **one** environment, so the store has to belong to the same
+    environment the run was pointed at. `AGENT_PROFILER_STORE` names it outright; otherwise,
+    if the harness homes have been redirected, the store follows them.
+
+    That second rule is not a test convenience, it is the correctness condition. Keying the
+    store on the real home regardless meant a run against a redirected environment wrote its
+    results into the real one's history — measurements of a sandbox filed as measurements of
+    the user's actual stack, where every later `report` would read them as its own. It was
+    the project's own suite that demonstrated it, writing fixture rows into a real state
+    directory, but a reader profiling a copied environment would have hit the same thing.
     """
     override = os.environ.get("AGENT_PROFILER_STORE")
     if override:
         return Path(override).expanduser()
+    # Whichever home was redirected; the Claude one first, since a redirected environment
+    # usually sets both and they sit side by side.
+    for name in ("AGENT_PROFILER_HOME", "AGENT_PROFILER_CLAUDE_HOME",
+                 "AGENT_PROFILER_CODEX_HOME"):
+        redirected = os.environ.get(name)
+        if redirected:
+            return Path(redirected).expanduser() / "agent-profiler-measurements"
     return Path.home() / ".local" / "state" / "agent-profiler" / "measurements"
 
 
@@ -63,7 +97,8 @@ def remember(data: dict, *, stage: str) -> Path | None:
     for and printed, and losing the copy is worse than losing the run. A read-only or absent
     state directory is the ordinary case on a locked-down machine.
     """
-    if not any(data.get(key) for key in MEASUREMENT_KEYS):
+    if not any(any(_is_measurement(row) for row in (data.get(key) or []))
+               for key in MEASUREMENT_KEYS):
         return None
     directory = store_dir()
     # The stage says what produced it and the stamp orders it. The suffix is found by
@@ -118,8 +153,8 @@ def stored(directory: Path | None = None) -> dict | None:
             continue
         found = False
         for key in MEASUREMENT_KEYS:
-            rows = data.get(key)
-            if isinstance(rows, list) and rows:
+            rows = [r for r in (data.get(key) or []) if _is_measurement(r)]
+            if rows:
                 merged[key].extend(rows)
                 found = True
         if found:

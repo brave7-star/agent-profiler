@@ -133,6 +133,69 @@ def test_an_unwritable_store_does_not_fail_a_paid_measurement():
                 os.environ["AGENT_PROFILER_STORE"] = saved
 
 
+def test_a_gate_refusal_is_not_stored_as_a_measurement():
+    """`evaluate` emits a row per candidate whatever happens, including ones its spend gate
+    refused and servers excluded by request. Those rows exist to say why nothing was
+    measured. Storing them filled the store with entries contributing nothing, so a report
+    claiming "cost figures come from N measurements" named more evidence than it had."""
+    refused = {"mode": "evaluate", "evaluations": [
+        {"server": "s", "status": "not_measured",
+         "gate": {"decision": "refused", "reason": "below threshold"}}]}
+    with _store() as directory:
+        assert st.remember(refused, stage="evaluate") is None
+        assert list(directory.glob("*.json")) == []
+        assert st.stored() is None
+
+
+def test_a_refusal_alongside_a_real_measurement_keeps_only_the_measurement():
+    """One artifact carries both, so the filter has to be per row rather than per file."""
+    mixed = {"mode": "evaluate", "evaluations": [
+        {"server": "measured-one", "status": "measured", "tokens": 382},
+        {"server": "refused-one", "status": "not_measured"},
+        {"server": "excluded-one", "status": "excluded_by_request"}]}
+    with _store():
+        assert st.remember(mixed, stage="evaluate") is not None
+        out = st.stored()
+    assert [e["server"] for e in out["evaluations"]] == ["measured-one"]
+
+
+def test_a_failed_probe_is_not_stored_as_a_reading():
+    """Failures are reported rather than omitted, but storing one would let it read
+    downstream as a measurement that happened."""
+    with _store():
+        assert st.remember({"mode": "evaluate", "instruction_measurements": [
+            {"ok": False, "file": "/w/CLAUDE.md", "error": "timeout"}]},
+            stage="measure-instructions") is None
+
+
+def test_the_store_follows_a_redirected_environment():
+    """A measurement describes one environment, so it must not be filed under another's.
+
+    Keying the store on the real home regardless meant a run pointed at a redirected
+    environment wrote into the real one's history — measurements of a sandbox filed as
+    measurements of the user's own stack, which every later report would read as its own.
+    This project's own suite demonstrated it by writing fixture rows into a real state
+    directory, and a reader profiling a copied environment would hit the same thing.
+    """
+    saved = {k: os.environ.get(k) for k in
+             ("AGENT_PROFILER_STORE", "AGENT_PROFILER_HOME")}
+    os.environ.pop("AGENT_PROFILER_STORE", None)
+    with tempfile.TemporaryDirectory() as raw:
+        os.environ["AGENT_PROFILER_HOME"] = raw
+        try:
+            assert Path(raw) in st.store_dir().parents
+            # And an explicit store still wins over the redirect, because a reader who names
+            # a location means it.
+            os.environ["AGENT_PROFILER_STORE"] = f"{raw}/elsewhere"
+            assert st.store_dir() == Path(raw) / "elsewhere"
+        finally:
+            for k, v in saved.items():
+                if v is None:
+                    os.environ.pop(k, None)
+                else:
+                    os.environ[k] = v
+
+
 def test_the_store_is_plain_json_anyone_can_read():
     """A measurement that cannot be read without this tool is one someone will pay for
     twice."""
